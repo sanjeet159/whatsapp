@@ -1,0 +1,8 @@
+{
+  "name": "OpenWA WhatsApp Gateway",
+  "description": "Open Source WhatsApp API Gateway & Dashboard for multi-session management, live WhatsApp messaging, webhooks, templates, and developer tooling.",
+  "prompt": "Rewrite this project as a React application, preserving the core features and business logic.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
