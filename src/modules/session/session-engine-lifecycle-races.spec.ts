@@ -76,6 +76,8 @@ const flush = async (): Promise<void> => {
 
 interface Internals {
   engines: EngineRegistry;
+  controls: { reapRetiredEngine(id: string): Promise<void> };
+  stoppingSessions: Set<string>;
   reconnectStates: Map<string, ReconnectState>;
   logger: { warn: (...args: unknown[]) => void };
   executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void>;
@@ -91,9 +93,13 @@ describe('SessionEngineLifecycle races', () => {
   let engineFactory: { create: jest.Mock; purgeSessionData: jest.Mock };
   let webhookService: { dispatch: jest.Mock };
   let config: Record<string, unknown>;
+  let dataSource: Record<string, unknown>;
+  let hookManager: { execute: jest.Mock };
 
   beforeEach(async () => {
     config = {};
+    dataSource = {};
+    hookManager = { execute: jest.fn().mockResolvedValue({ continue: true, data: {} }) };
     repository = {
       findOne: jest.fn().mockResolvedValue(session()),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
@@ -112,7 +118,7 @@ describe('SessionEngineLifecycle races', () => {
         PresenceStore,
         { provide: getRepositoryToken(Session, 'data'), useValue: repository },
         { provide: getRepositoryToken(Message, 'data'), useValue: { find: jest.fn().mockResolvedValue([]) } },
-        { provide: getDataSourceToken('data'), useValue: {} },
+        { provide: getDataSourceToken('data'), useValue: dataSource },
         { provide: EngineFactory, useValue: engineFactory },
         EngineRegistry,
         SessionLidResolver,
@@ -128,7 +134,7 @@ describe('SessionEngineLifecycle races', () => {
           },
         },
         { provide: WebhookService, useValue: { dispatch: jest.fn().mockResolvedValue(undefined) } },
-        { provide: HookManager, useValue: { execute: jest.fn().mockResolvedValue({ continue: true, data: {} }) } },
+        { provide: HookManager, useValue: hookManager },
         {
           provide: ConfigService,
           useValue: { get: jest.fn(<T>(key: string, def?: T): T => (key in config ? (config[key] as T) : (def as T))) },
@@ -219,6 +225,224 @@ describe('SessionEngineLifecycle races', () => {
 
       expect(await outcome).toBeInstanceOf(SessionStoppedException);
       expect(engineFactory.create).not.toHaveBeenCalled();
+    });
+  });
+
+  // A delete removes the rows of a session with a long history in many batches, long after its engine is gone.
+  // The stop mark it set cannot refuse a start for that long: start() takes a mark that was already there when
+  // it began for a stale one and clears it, which for the mark of a delete left an engine running on the
+  // deleted session.
+  describe('start against a delete in flight', () => {
+    type Gate = { promise: Promise<unknown[]>; resolve: (rows: unknown[]) => void };
+    let gates: Gate[];
+    let transaction: jest.Mock;
+
+    // The next delete to look up rows waits here, which is where a delete spends its time on a long history.
+    const hold = (): Gate => {
+      const gate = deferred<unknown[]>();
+      gates.push(gate);
+      return gate;
+    };
+
+    // What the delete ended with: nothing, or its error.
+    const settle = (deleting: Promise<void>): Promise<unknown> =>
+      deleting.then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+    // Starts a delete and leaves it waiting on its first batch, after it evicted the engine of a running session.
+    const deleteInBatchPhase = async (): Promise<{ gate: Gate; settled: Promise<unknown> }> => {
+      await lifecycle.start(ID);
+      const gate = hold();
+      const settled = settle(lifecycle.delete(ID));
+      await flush();
+      expect(internals.engines.has(ID)).toBe(false);
+      return { gate, settled };
+    };
+
+    beforeEach(() => {
+      gates = [];
+      const read = jest.fn(() => gates.shift()?.promise ?? Promise.resolve([]));
+      // The messages of a session are read through a query builder: every chain call returns itself.
+      const query: Record<string, jest.Mock> = { getRawMany: read };
+      for (const name of ['select', 'addSelect', 'where', 'andWhere', 'orderBy', 'addOrderBy', 'limit']) {
+        query[name] = jest.fn().mockReturnValue(query);
+      }
+      const rows = { find: read, createQueryBuilder: jest.fn(() => query), delete: jest.fn() };
+      const manager = { delete: jest.fn().mockResolvedValue({ affected: 0 }), remove: jest.fn() };
+      transaction = jest.fn((work: (m: unknown) => Promise<void>) => work(manager));
+      Object.assign(dataSource, {
+        options: { type: 'better-sqlite3' },
+        getRepository: jest.fn(() => rows),
+        transaction,
+      });
+    });
+
+    it.each([
+      ['an operator start', { explicit: true }],
+      ['a boot or takeover start', { explicit: false }],
+    ])('refuses %s and registers no engine', async (_who, options) => {
+      const { gate, settled } = await deleteInBatchPhase();
+
+      await expect(lifecycle.start(ID, options)).rejects.toBeInstanceOf(SessionStoppedException);
+
+      expect(engineFactory.create).toHaveBeenCalledTimes(1);
+      expect(internals.engines.has(ID)).toBe(false);
+      gate.resolve([]);
+      expect(await settled).toBeUndefined();
+      expect(internals.engines.has(ID)).toBe(false);
+    });
+
+    it('leaves the stop mark of the delete in place for the whole delete', async () => {
+      const { gate, settled } = await deleteInBatchPhase();
+
+      await expect(lifecycle.start(ID)).rejects.toBeInstanceOf(SessionStoppedException);
+
+      expect(internals.stoppingSessions.has(ID)).toBe(true);
+      gate.resolve([]);
+      await settled;
+      expect(internals.stoppingSessions.has(ID)).toBe(false);
+    });
+
+    it('counts the delete as live until the rows are gone, so the lease of the session is renewed', async () => {
+      expect(lifecycle.isEngineActive(ID)).toBe(false);
+      const { gate, settled } = await deleteInBatchPhase();
+
+      // The engine is evicted and nothing is starting or reconnecting: only the delete is left.
+      expect(lifecycle.isEngineActive(ID)).toBe(true);
+
+      gate.resolve([]);
+      await settled;
+      expect(lifecycle.isEngineActive(ID)).toBe(false);
+    });
+
+    it('lets the session start again when the delete failed', async () => {
+      transaction.mockRejectedValueOnce(new Error('canceling statement due to statement timeout'));
+      const { gate, settled } = await deleteInBatchPhase();
+
+      gate.resolve([]);
+      expect(((await settled) as Error).message).toContain('statement timeout');
+      expect(lifecycle.isEngineActive(ID)).toBe(false);
+
+      await lifecycle.start(ID, { explicit: true });
+
+      expect(internals.engines.has(ID)).toBe(true);
+    });
+
+    it('holds back a start until the last of two overlapping deletes ends', async () => {
+      transaction.mockRejectedValueOnce(new Error('canceling statement due to statement timeout'));
+      const first = await deleteInBatchPhase();
+      const secondGate = hold();
+      const second = settle(lifecycle.delete(ID));
+      await flush();
+
+      // The first delete fails and drops the stop mark the second one is still running under.
+      first.gate.resolve([]);
+      expect(((await first.settled) as Error).message).toContain('statement timeout');
+      await expect(lifecycle.start(ID)).rejects.toBeInstanceOf(SessionStoppedException);
+      expect(internals.engines.has(ID)).toBe(false);
+
+      secondGate.resolve([]);
+      expect(await second).toBeUndefined();
+      await lifecycle.start(ID);
+      expect(internals.engines.has(ID)).toBe(true);
+    });
+
+    it('retires a start whose row read was still pending when the delete began', async () => {
+      const read = deferred<Session>();
+      repository.findOne.mockReturnValueOnce(read.promise);
+      const starting = lifecycle.start(ID, { explicit: true }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      await flush();
+      const gate = hold();
+      const settled = settle(lifecycle.delete(ID));
+      await flush();
+
+      read.resolve(session());
+
+      expect(await starting).toBeInstanceOf(SessionStoppedException);
+      expect(engineFactory.create).not.toHaveBeenCalled();
+      gate.resolve([]);
+      await settled;
+      expect(internals.engines.has(ID)).toBe(false);
+    });
+
+    // A start waiting in its session:starting hook has armed no reconnect state yet, so the stop or delete that
+    // retires it has nothing to cancel. The start arms the state afterwards and must drop it when it is retired.
+    describe('a start retired while it waits in its session:starting hook', () => {
+      const parkInHook = async (): Promise<{ release: () => void; outcome: Promise<unknown> }> => {
+        const hook = deferred();
+        hookManager.execute.mockImplementation(async (event: string) => {
+          if (event === 'session:starting') await hook.promise;
+          return { continue: true, data: {} };
+        });
+        const outcome = lifecycle.start(ID, { explicit: true }).then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        await flush();
+        expect(internals.reconnectStates.has(ID)).toBe(false);
+        return { release: hook.resolve, outcome };
+      };
+
+      it('leaves no reconnect state behind after a stop', async () => {
+        const { release, outcome } = await parkInHook();
+        await lifecycle.stop(ID);
+
+        release();
+        await outcome;
+
+        expect(internals.engines.has(ID)).toBe(false);
+        expect(internals.reconnectStates.has(ID)).toBe(false);
+      });
+
+      it('leaves no reconnect state behind after a delete that is still running', async () => {
+        const { release, outcome } = await parkInHook();
+        const gate = hold();
+        const deleted = settle(lifecycle.delete(ID));
+        await flush();
+
+        release();
+        await outcome;
+
+        expect(internals.engines.has(ID)).toBe(false);
+        expect(internals.reconnectStates.has(ID)).toBe(false);
+        gate.resolve([]);
+        await deleted;
+      });
+
+      it('leaves no reconnect state behind after a delete that has finished', async () => {
+        const { release, outcome } = await parkInHook();
+        await settle(lifecycle.delete(ID));
+        repository.findOne.mockResolvedValue(null);
+
+        release();
+        await outcome;
+
+        expect(internals.engines.has(ID)).toBe(false);
+        expect(internals.reconnectStates.has(ID)).toBe(false);
+      });
+
+      it('keeps the state of an engine that registered while the retired one was torn down', async () => {
+        const destroyed = deferred();
+        const retired = { ...makeEngine(), destroy: jest.fn().mockReturnValue(destroyed.promise) };
+        const replacement = makeEngine();
+        const state: ReconnectState = { attempts: 0, timer: null, maxAttempts: 5, baseDelay: 5000 };
+        internals.engines.set(ID, retired as never);
+
+        const reaping = internals.controls.reapRetiredEngine(ID);
+        await flush();
+        internals.engines.set(ID, replacement as never);
+        internals.reconnectStates.set(ID, state);
+        destroyed.resolve();
+        await reaping;
+
+        expect(internals.engines.get(ID)).toBe(replacement);
+        expect(internals.reconnectStates.get(ID)).toBe(state);
+      });
     });
   });
 

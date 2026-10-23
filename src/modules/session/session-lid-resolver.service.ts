@@ -29,6 +29,15 @@ export class SessionLidResolver {
    */
   private readonly retryAfter = new Map<string, number>();
   private static readonly RETRY_AFTER_MS = 60_000;
+  /** Lookups under way, per key, so messages that arrive together from one sender share a single one. */
+  private readonly inFlight = new Map<string, Promise<string | null>>();
+  /**
+   * Cached answers the lid table did not take, per key, with when to report them again. An answer is
+   * otherwise reported once, so a negative that failed to write would leave a number the contact hid
+   * mapped until a restart (#1058), and a phone that failed would keep the lid out of a chat fence. At most
+   * one write per key per hold, as for an unmapped lid.
+   */
+  private readonly unstored = new Map<string, number>();
 
   constructor(
     private readonly engines: EngineRegistry,
@@ -46,11 +55,24 @@ export class SessionLidResolver {
     const key = `${sessionId}:${contactId}`;
     const cached = this.cache.get(key);
     if (cached !== undefined) {
+      if ((this.unstored.get(key) ?? Infinity) <= Date.now()) this.persist(key, sessionId, contactId, cached);
       return cached;
     }
     if ((this.retryAfter.get(key) ?? 0) > Date.now()) {
       return null;
     }
+    // Neither the cache nor the hold above is set until a lookup lands, so a burst of messages from a
+    // new sender, as a reconnect delivers, would otherwise start one engine lookup per message.
+    let lookup = this.inFlight.get(key);
+    if (!lookup) {
+      lookup = this.lookup(sessionId, contactId, key).finally(() => this.inFlight.delete(key));
+      this.inFlight.set(key, lookup);
+    }
+    return lookup;
+  }
+
+  /** One engine lookup for a sender, with its caching and persistence. */
+  private async lookup(sessionId: string, contactId: string, key: string): Promise<string | null> {
     let phone: string | null;
     // `resolved` marks a definitive engine answer: a rejection or a missing engine is a transient
     // unknown, NOT "this contact has no phone", and must never overwrite a stored mapping (#1058).
@@ -84,6 +106,7 @@ export class SessionLidResolver {
       if (this.cache.size >= SessionLidResolver.CACHE_MAX) {
         for (const oldest of this.cache.keys()) {
           this.cache.delete(oldest);
+          this.unstored.delete(oldest);
           break;
         }
       }
@@ -93,10 +116,22 @@ export class SessionLidResolver {
     // when the operator never sent to them (#583 R3 Phase 2). A definitive null is persisted too, so
     // a phone that later becomes hidden overwrites its stale mapping instead of being served forever
     // (#1058). Reuses the resolution above — no extra network call — and is fire-and-forget so
-    // dispatch never blocks/fails on it.
-    if (phone || resolved) {
-      void this.lidMappingStore?.remember(userPart(contactId), phone, sessionId)?.catch(() => {});
-    }
+    // dispatch never blocks/fails on it. The store keeps a phone another session stored, since that
+    // account may still see the number.
+    if (phone || resolved) this.persist(key, sessionId, contactId, phone);
     return phone;
+  }
+
+  /** Report an answer to the lid table; one the table did not take is reported again after the hold. */
+  private persist(key: string, sessionId: string, contactId: string, phone: string | null): void {
+    this.unstored.delete(key);
+    void this.lidMappingStore
+      ?.remember(userPart(contactId), phone, sessionId)
+      ?.then(stored => {
+        if (stored === false && this.cache.get(key) === phone) {
+          this.unstored.set(key, Date.now() + SessionLidResolver.RETRY_AFTER_MS);
+        }
+      })
+      .catch(() => {});
   }
 }

@@ -1,7 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
 import { DEFAULT_PUPPETEER_ARGS } from '../../config/configuration';
+import { isEnvPinned } from '../../config/env-precedence';
 import { postgresSchemaError } from '../../config/env.validation';
 import type { EngineFactory } from '../../engine/engine.factory';
+import { datastoreInUse, namesBundledContainer } from '../docker';
 import { DatabaseConfigDto, EngineConfigDto, RedisConfigDto, StorageConfigDto } from './dto/save-config.dto';
 
 // Mutable accumulator threaded through the pipeline stages and per-section appliers extracted
@@ -20,6 +22,12 @@ function setSecret(updates: Record<string, string>, key: string, value: string |
   if (value) updates[key] = value;
 }
 
+// What the next boot reads for a key (a host, a selection) before this save changes it: the value the environment
+// pins, else the stored one.
+function nextBootValue(key: string, existing: Record<string, string>): string | undefined {
+  return isEnvPinned(key) ? process.env[key] : existing[key];
+}
+
 // What the next boot's validation (env.validation.ts) reads from these keys, refused here instead: the saved
 // file is loaded at boot, and a value it rejects crash-loops the instance and the dashboard that could undo it.
 function portValue(label: string, value: string): string {
@@ -30,6 +38,30 @@ function portValue(label: string, value: string): string {
   return port;
 }
 
+// The selection a section applies to: the one sent, else the stored one, else the one the environment pins. Only a
+// sent one is written, so a save that leaves it out (the page does for a pinned type in a card left untouched) never
+// writes a selection over the stored choice. When the environment pins another selection than the stored one, the
+// section's fields belong to neither boot: applied to the stored mode they reach the pinned boot now (a PostgreSQL
+// DATABASE_NAME refuses a SQLite boot), applied to the pinned mode they reach the stored one once the pin is
+// removed. Nothing of the section is written then (null). With no selection at all it cannot be read, and is refused.
+function sectionType<T extends string>(
+  section: string,
+  key: string,
+  sent: T | undefined,
+  existing: Record<string, string>,
+  allowed: readonly T[],
+): T | null {
+  if (sent) return sent;
+  const stored = allowed.find(v => v === existing[key]);
+  const pinned = isEnvPinned(key) ? allowed.find(v => v === process.env[key]) : undefined;
+  if (stored && pinned && stored !== pinned) return null;
+  const type = stored ?? pinned;
+  if (type === undefined) {
+    throw new BadRequestException(`${section}.type must be one of the following values: ${allowed.join(', ')}`);
+  }
+  return type;
+}
+
 // Database. NOTE: these keys must match what src/config/configuration.ts reads.
 export function applyDatabaseSection(
   database: DatabaseConfigDto,
@@ -37,7 +69,9 @@ export function applyDatabaseSection(
   ctx: ConfigSectionContext,
 ): void {
   const { updates, staleKeys, profiles } = ctx;
-  updates.DATABASE_TYPE = database.type || 'sqlite';
+  const type = sectionType('database', 'DATABASE_TYPE', database.type, existing, ['sqlite', 'postgres']);
+  if (type === null) return;
+  if (database.type) updates.DATABASE_TYPE = database.type;
   if (database.builtIn !== undefined) {
     updates.POSTGRES_BUILTIN = database.builtIn ? 'true' : 'false';
   }
@@ -45,26 +79,38 @@ export function applyDatabaseSection(
   // is inherited so a partial payload stays in the current mode instead of silently
   // flipping to external.
   const dbBuiltIn = database.builtIn ?? existing.POSTGRES_BUILTIN === 'true';
-  if (database.type === 'postgres') {
+  if (type === 'postgres') {
     if (dbBuiltIn) {
       // Built-in PostgreSQL - use container name as host
       updates.DATABASE_HOST = 'postgres';
       updates.DATABASE_PORT = '5432';
-      updates.DATABASE_USERNAME = 'openwa';
+      // A database the next boot already dials on the bundled container (by a host that names it in any spelling)
+      // keeps the user, database and schema it uses there: such a file reads as built-in, and a save that changes
+      // nothing else must not move the instance to another database. From anywhere else they belong to another server.
+      const servesStored =
+        nextBootValue('DATABASE_TYPE', existing) === 'postgres' &&
+        namesBundledContainer('postgres', nextBootValue('DATABASE_HOST', existing));
+      updates.DATABASE_USERNAME = (servesStored && existing.DATABASE_USERNAME) || 'openwa';
       // The bundled credential is only the DEFAULT. Secrets are never echoed back to the form,
       // so an absent password field means "unchanged", not "reset to 'openwa'" — and the
       // dashboard ALWAYS sends builtIn, so keying the reset on "explicit builtIn:true" reset a
       // re-keyed container on every save from the Infrastructure page.
       // What decides it is whether the stored password belongs to this same bundled container:
-      // it does when the previous mode was already built-in. Coming from external, the stored
-      // value is the external DB's credential and must not be carried into the container.
-      const storedPassword = existing.POSTGRES_BUILTIN === 'true' ? existing.DATABASE_PASSWORD : undefined;
+      // it does when the previous mode was already built-in, or when the next boot already dials the
+      // bundled host with it (the environment's host, else the file's, a file that names it without the
+      // flag included, in any spelling that reaches the container). Coming from external, the stored value is the
+      // external DB's credential and must not be carried into the container.
+      const storedPassword =
+        existing.POSTGRES_BUILTIN === 'true' ||
+        namesBundledContainer('postgres', nextBootValue('DATABASE_HOST', existing))
+          ? existing.DATABASE_PASSWORD
+          : undefined;
       updates.DATABASE_PASSWORD = database.password || storedPassword || 'openwa';
-      updates.DATABASE_NAME = 'openwa';
+      updates.DATABASE_NAME = (servesStored && existing.DATABASE_NAME) || 'openwa';
       // Built-in Postgres is initialized with the default 'public' schema (see
       // scripts/postgres-init-schema.sh). Pin it so a later switch from a custom-schema
       // external DB to built-in doesn't carry a stale POSTGRES_SCHEMA forward.
-      updates.POSTGRES_SCHEMA = 'public';
+      updates.POSTGRES_SCHEMA = (servesStored && existing.POSTGRES_SCHEMA) || 'public';
       profiles.push('postgres');
     } else {
       // External PostgreSQL. Flipping built-in -> external must not carry the bundled
@@ -89,7 +135,8 @@ export function applyDatabaseSection(
         updates.POSTGRES_SCHEMA = database.schema || 'public';
       }
     }
-    if (database.poolSize !== undefined) {
+    // null is what JSON makes of an emptied number input, and reads as absent like the other fields.
+    if (database.poolSize !== undefined && database.poolSize !== null) {
       if (!Number.isInteger(database.poolSize) || database.poolSize < 0) {
         throw new BadRequestException(
           `database.poolSize must be a non-negative integer (got ${JSON.stringify(database.poolSize)})`,
@@ -133,7 +180,10 @@ export function applyRedisSection(
   const { updates, staleKeys, profiles } = ctx;
   if (redis.enabled !== undefined) updates.REDIS_ENABLED = redis.enabled ? 'true' : 'false';
   if (redis.builtIn !== undefined) updates.REDIS_BUILTIN = redis.builtIn ? 'true' : 'false';
-  if (redis.builtIn === true) {
+  // An absent builtIn keeps the stored mode, as for the database: a stored built-in Redis keeps its bundled host
+  // rather than taking the fields sent (the page leaves the flag out beside a pinned host, and sends that host).
+  const redisBuiltIn = redis.builtIn ?? existing.REDIS_BUILTIN === 'true';
+  if (redisBuiltIn) {
     // Built-in Redis - use container name as host. The bundled container runs without
     // auth, so a password saved by an earlier external setup is stale: leaving it
     // would make the client AUTH against a passwordless server on the next boot.
@@ -148,10 +198,17 @@ export function applyRedisSection(
     }
   }
   setSecret(updates, 'REDIS_PASSWORD', redis.password);
-  const redisEnabled = redis.enabled ?? existing.REDIS_ENABLED === 'true';
-  const redisBuiltIn = redis.builtIn ?? existing.REDIS_BUILTIN === 'true';
-  if (redisEnabled && redisBuiltIn) {
-    profiles.push('redis');
+  // What the next boot reads: a value the environment pins, else this save's, else the stored one. The queue
+  // section is applied first, so its switch is in `updates` already.
+  const saved = (key: string): string | undefined => updates[key] ?? existing[key];
+  if (datastoreInUse('redis', key => (isEnvPinned(key) ? process.env[key] : saved(key)))) {
+    if (redisBuiltIn) profiles.push('redis');
+  } else if (!datastoreInUse('redis', saved)) {
+    // Nothing the next boot runs reaches Redis, and the file does not either once a pin is removed, so no
+    // bundled container may be started for it at boot or kept by the restart, which keeps a container while the
+    // saved host still names it. A Redis only a pin switches off keeps the stored choice.
+    updates.REDIS_BUILTIN = 'false';
+    if (namesBundledContainer('redis', saved('REDIS_HOST'))) staleKeys.add('REDIS_HOST');
   }
 }
 
@@ -164,11 +221,13 @@ export function applyStorageSection(
   ctx: ConfigSectionContext,
 ): void {
   const { updates, staleKeys, profiles } = ctx;
-  updates.STORAGE_TYPE = storage.type || 'local';
+  const type = sectionType('storage', 'STORAGE_TYPE', storage.type, existing, ['local', 's3']);
+  if (type === null) return;
+  if (storage.type) updates.STORAGE_TYPE = storage.type;
   if (storage.builtIn !== undefined) {
     updates.MINIO_BUILTIN = storage.builtIn ? 'true' : 'false';
   }
-  if (storage.type === 'local') {
+  if (type === 'local') {
     // Switching to local: drop stale S3 keys, and reset the built-in flag with them —
     // there is no bundled MinIO backing a local storage path.
     updates.MINIO_BUILTIN = 'false';
@@ -179,15 +238,25 @@ export function applyStorageSection(
     for (const k of ['S3_ENDPOINT', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_BUCKET', 'S3_REGION']) {
       staleKeys.add(k);
     }
-  } else if (storage.type === 's3') {
+  } else {
     staleKeys.add('STORAGE_LOCAL_PATH');
-    if (storage.builtIn === true) {
-      // Built-in MinIO - use container name as endpoint
+    // An absent builtIn keeps the stored mode, as for the database and Redis.
+    if (storage.builtIn ?? existing.MINIO_BUILTIN === 'true') {
+      // Built-in MinIO - use container name as endpoint. The bundled keys are only the DEFAULT, as for the database
+      // password: keys the next boot already dials the bundled endpoint with (the flag already set, or the bundled
+      // endpoint pinned or stored, in any spelling) are the ones that container was created with, and are kept.
+      const keepKeys =
+        existing.MINIO_BUILTIN === 'true' || namesBundledContainer('minio', nextBootValue('S3_ENDPOINT', existing));
       updates.S3_ENDPOINT = 'http://minio:9000';
-      updates.S3_ACCESS_KEY_ID = 'minioadmin';
-      updates.S3_SECRET_ACCESS_KEY = 'minioadmin';
-      updates.S3_BUCKET = 'openwa';
-      updates.S3_REGION = 'us-east-1';
+      updates.S3_ACCESS_KEY_ID = (keepKeys && (existing.S3_ACCESS_KEY_ID || existing.S3_ACCESS_KEY)) || 'minioadmin';
+      updates.S3_SECRET_ACCESS_KEY =
+        (keepKeys && (existing.S3_SECRET_ACCESS_KEY || existing.S3_SECRET_KEY)) || 'minioadmin';
+      // As for the database: a bucket the next boot already reaches on the bundled MinIO is kept with its region.
+      const servesStored =
+        nextBootValue('STORAGE_TYPE', existing) === 's3' &&
+        namesBundledContainer('minio', nextBootValue('S3_ENDPOINT', existing));
+      updates.S3_BUCKET = (servesStored && existing.S3_BUCKET) || 'openwa';
+      updates.S3_REGION = (servesStored && existing.S3_REGION) || 'us-east-1';
       profiles.push('minio');
     } else {
       // External S3/MinIO. Flipping built-in -> external must not carry the bundled

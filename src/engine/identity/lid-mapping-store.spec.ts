@@ -1,6 +1,8 @@
-import { FindOperator, In, Repository } from 'typeorm';
+import { randomUUID } from 'crypto';
+import { DataSource, FindOperator, In, Repository } from 'typeorm';
 import { LidMappingStoreService } from './lid-mapping-store.service';
 import { LidMapping } from './lid-mapping.entity';
+import { Session } from '../../modules/session/entities/session.entity';
 
 /** A where-clause value: a literal, or a TypeORM `In([...])` FindOperator. */
 type Cond = string | FindOperator<unknown>;
@@ -73,16 +75,7 @@ describe('LidMappingStoreService', () => {
     );
   });
 
-  it('caches a negative result (lid known-but-unresolved)', async () => {
-    const repo = makeFakeRepo();
-    const store = await newStore(repo);
-    await store.remember('333', null);
-    expect(store.getCached('333')).toBeNull();
-    expect(store.lidsForPhone('anything')).toEqual([]);
-    expect(repo.upsert).toHaveBeenCalledWith(expect.objectContaining({ lid: '333', phone: null }), ['lid']);
-  });
-
-  it('is last-write-wins and reindexes the reverse map on a phone change', async () => {
+  it('a phone is last-write-wins and reindexes the reverse map on a phone change', async () => {
     const store = await newStore(makeFakeRepo([{ lid: '111', phone: '628999' }]));
     await store.remember('111', '628000');
     expect(store.getCached('111')).toBe('628000');
@@ -161,7 +154,8 @@ describe('LidMappingStoreService — LRU cap', () => {
   it('skips a table row this process has since re-mapped, and falls back to the cache on a read error', async () => {
     const repo = makeFakeRepo([{ lid: '111', phone: '628999' }]);
     const store = await newStore(repo);
-    repo.upsert.mockResolvedValueOnce({}); // the re-map has not reached the table: the row is stale
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost')); // the re-map has not reached the table
     await store.remember('111', '628000');
     expect(await store.findLidsForPhone('628999')).toEqual([]);
 
@@ -216,6 +210,49 @@ describe('LidMappingStoreService — LRU cap', () => {
     await store.remember('lid-c', '620004'); // re-maps lid-c away from 620003
     expect(phoneToLids.has('620003')).toBe(false);
     expect([...phoneToLids.keys()].sort()).toEqual(['620002', '620004']);
+  });
+
+  it('drops who reported a phone along with the evicted entry', async () => {
+    process.env.LID_MAPPING_CACHE_MAX = '2';
+    const store = await newStore(makeFakeRepo());
+    const seenBy = (store as unknown as { seenBy: Map<string, Set<string>> }).seenBy;
+
+    await store.remember('lid-a', '620001', 's1');
+    await store.remember('lid-b', '620002', 's1');
+    await store.remember('lid-c', '620003', 's1'); // evicts lid-a
+
+    expect([...seenBy.keys()].sort()).toEqual(['lid-b', 'lid-c']);
+  });
+
+  it('holds back a failed write only while its entry is cached', async () => {
+    process.env.LID_MAPPING_CACHE_MAX = '2';
+    const repo = makeFakeRepo();
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    repo.upsert.mockRejectedValue(new Error('connection lost'));
+    for (const lid of ['lid-a', 'lid-b', 'lid-c']) await store.remember(lid, '620001', 's1');
+    repo.upsert.mockClear();
+
+    await store.remember('lid-c', '620001', 's1');
+    expect(repo.upsert).not.toHaveBeenCalled();
+    await store.remember('lid-a', '620001', 's1');
+    expect(repo.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('forgets a failed write along with the evicted entry', async () => {
+    process.env.LID_MAPPING_CACHE_MAX = '1';
+    const repo = makeFakeRepo([{ lid: 'lid-a', phone: '620001' }]);
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('lid-a', '620002'); // fails; the table keeps 620001
+    await store.remember('lid-b', '620003'); // evicts lid-a
+    store.getCached('lid-a'); // warms lid-a back from its row
+    for (let i = 0; i < 20 && store.getCached('lid-a') === undefined; i++) await new Promise(r => setImmediate(r));
+    expect(store.getCached('lid-a')).toBe('620001');
+
+    repo.rows[0].phone = '620009'; // another node re-maps it
+    expect(await store.findPhoneForLid('lid-a@lid')).toBe('620009');
   });
 
   it('LID_MAPPING_CACHE_MAX=0 disables the cap (legacy unbounded behaviour)', async () => {
@@ -625,12 +662,14 @@ describe('LidMappingStoreService — deterministic persisted lookups (authorizat
   });
 
   it('a stale cached negative never shadows a mapping the table has', async () => {
-    const repo = makeFakeRepo();
-    const store = await newStore(repo);
-    await store.remember('222', null); // this node cached a negative
+    const repo = makeFakeRepo([{ lid: '222', phone: null }]);
+    const store = await newStore(repo); // this node cached a negative
+    expect(store.getCached('222')).toBeNull();
     repo.rows[0].phone = '628888'; // another node has since mapped it in the table
     expect(await store.findPhoneForLid('222@lid')).toBe('628888');
     expect(await store.phonesForLidsPersisted(['222'])).toEqual({ 222: '628888' });
+    expect(await store.findLidsForPhone('628888')).toEqual(['222']);
+    expect(await store.lidsForPhonesPersisted(['628888'])).toEqual({ 628888: ['222'] });
   });
 
   it('a cached mapping another node has re-mapped answers the table row, not the cache', async () => {
@@ -777,10 +816,610 @@ describe('LidMappingStoreService — deterministic persisted lookups (authorizat
     expect(await store.findLidsForPhone('628999')).toEqual(['222']);
   });
 
+  it('answers the row of a lid another node has re-mapped, in every lookup', async () => {
+    const repo = makeFakeRepo([{ lid: '111', phone: '628111' }]);
+    const store = await newStore(repo);
+    repo.rows[0].phone = '628222'; // another node re-mapped 111; this node's cache still says 628111
+
+    expect(await store.findPhoneForLid('111@lid')).toBe('628222');
+    expect(await store.phonesForLidsPersisted(['111'])).toEqual({ 111: '628222' });
+    expect(await store.findLidsForPhone('628222')).toEqual(['111']);
+    expect(await store.lidsForPhonesPersisted(['628222', '628111'])).toEqual({ 628222: ['111'], 628111: [] });
+  });
+
+  it('answers no phone for a lid whose phone write has not reached the table, in every lookup', async () => {
+    const repo = makeFakeRepo([
+      { lid: '111', phone: '628111' },
+      { lid: '444', phone: '628444' },
+    ]);
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    const none = async (lid: string, phones: string[]) => {
+      expect(await store.findPhoneForLid(`${lid}@lid`)).toBeNull();
+      expect(await store.phonesForLidsPersisted([lid])).toEqual({ [lid]: null });
+      for (const phone of phones) expect(await store.findLidsForPhone(phone)).toEqual([]);
+      expect(await store.lidsForPhonesPersisted(phones)).toEqual(Object.fromEntries(phones.map(p => [p, []])));
+    };
+
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628222'); // a re-map: the table still names the old phone
+    await none('111', ['628111', '628222']);
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('333', '628333'); // a first write: the table has no row
+    await none('333', ['628333']);
+
+    let land!: () => void;
+    repo.upsert.mockImplementationOnce(
+      (values: Partial<LidMapping>) =>
+        new Promise(resolve => {
+          land = () => {
+            repo.rows[1] = { ...repo.rows[1], ...values };
+            resolve({});
+          };
+        }),
+    );
+    const writing = store.remember('444', '628555', 'sess-1');
+    await none('444', ['628444', '628555']); // still in flight
+    land();
+    await writing;
+    await store.remember('111', '628222', 'sess-1'); // the failed re-map lands on its next report
+
+    expect(await store.findPhoneForLid('444@lid')).toBe('628555');
+    expect(await store.phonesForLidsPersisted(['111', '444'])).toEqual({ 111: '628222', 444: '628555' });
+    expect(await store.lidsForPhonesPersisted(['628222', '628111'])).toEqual({ 628222: ['111'], 628111: [] });
+  });
+
+  it('answers a cached phone the table has no row for yet while its first write is in flight', async () => {
+    const repo = makeFakeRepo();
+    const store = await newStore(repo);
+    let land!: () => void;
+    repo.upsert.mockImplementationOnce(
+      (values: Partial<LidMapping>) =>
+        new Promise(resolve => {
+          land = () => {
+            repo.rows.push(values as LidMapping);
+            resolve({});
+          };
+        }),
+    );
+    const writing = store.remember('111', '628111', 'sess-1');
+
+    expect(await store.findPhoneForLid('111@lid')).toBe('628111');
+    expect(await store.phonesForLidsPersisted(['111'])).toEqual({ 111: '628111' });
+    expect(await store.findLidsForPhone('628111')).toEqual(['111']);
+    expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
+    land();
+    await writing;
+  });
+
+  it('keeps answering a phone the table holds when only another session failed to take it', async () => {
+    const repo = makeFakeRepo([{ lid: '111', phone: '628111' }]);
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628111', 'sess-2');
+
+    expect(await store.findPhoneForLid('111@lid')).toBe('628111');
+    expect(await store.phonesForLidsPersisted(['111'])).toEqual({ 111: '628111' });
+    expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
+  });
+
+  it('settles two overlapping writes for a lid by the phone the cache holds', async () => {
+    const repo = makeFakeRepo([
+      { lid: '111', phone: '628111' },
+      { lid: '222', phone: '628222' },
+    ]);
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+    /** Holds the next upsert until settle(true) applies it to row i, or settle(false) fails it. */
+    const held = (i: number) => {
+      let settle!: (ok: boolean) => void;
+      repo.upsert.mockImplementationOnce(
+        (values: Partial<LidMapping>) =>
+          new Promise((resolve, reject) => {
+            settle = ok => {
+              if (!ok) return reject(new Error('connection lost'));
+              repo.rows[i] = { ...repo.rows[i], ...values };
+              resolve({});
+            };
+          }),
+      );
+      return (ok: boolean) => settle(ok);
+    };
+
+    const older = held(0);
+    const first = store.remember('111', '628000', 'sess-1');
+    await store.remember('111', '628001', 'sess-1'); // the newer one lands first
+    older(false);
+    await first;
+    repo.rows[0].phone = '628999'; // another node re-maps it: nothing of this node's is pending
+    expect(await store.findPhoneForLid('111@lid')).toBe('628999');
+
+    const older2 = held(1);
+    const second = store.remember('222', '628000', 'sess-1');
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('222', '628001', 'sess-1'); // the newer one fails
+    older2(true);
+    await second;
+    expect(await store.findPhoneForLid('222@lid')).toBeNull(); // the cached 628001 is still not stored
+  });
+
+  it('answers the table again once a failed write has landed, or the table was reloaded', async () => {
+    const repo = makeFakeRepo([
+      { lid: '111', phone: '628111' },
+      { lid: '222', phone: '628222' },
+    ]);
+    const store = await newStore(repo);
+    jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn').mockImplementation(() => {});
+
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628000', 'sess-1');
+    await store.remember('111', '628000', 'sess-1'); // lands
+    repo.rows[0].phone = '628999'; // another node re-maps it
+    expect(await store.findPhoneForLid('111@lid')).toBe('628999');
+
+    repo.upsert.mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('222', '628000', 'sess-1');
+    await store.reload();
+    repo.rows[1].phone = '628999';
+    expect(await store.findPhoneForLid('222@lid')).toBe('628999');
+  });
+
   it('findLidsForPhone falls back to the cache when the table read throws', async () => {
     const repo = makeFakeRepo([{ lid: '111', phone: '628999' }]);
     const store = await newStore(repo);
     repo.find.mockRejectedValueOnce(new Error('no such table'));
     expect(await store.findLidsForPhone('628999')).toEqual(['111']);
+  });
+});
+
+describe('LidMappingStoreService: a negative result on the shared table', () => {
+  // Linked sessions in `sessions` (each carries its account's phone); `gone` names one that was deleted.
+  const [s1, s2, s3, s9] = ['1', '2', '3', '9'].map(n => `0000000${n}-0000-4000-8000-000000000000`);
+  const gone = '0000000d-0000-4000-8000-000000000000';
+  let ds: DataSource;
+  let repo: Repository<LidMapping>;
+  let store: LidMappingStoreService;
+  let warn: jest.SpyInstance;
+  let clock = 0;
+  const row = (lid: string) => repo.findOne({ where: { lid } });
+  /** Moves the store's clock on, past or short of the hold after a failed write. */
+  const later = (ms: number) => (clock += ms);
+
+  /** Holds the next call of a repository method until `release` is called; `reached` settles on entry. */
+  function hold(method: 'upsert' | 'update') {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const reached = new Promise<void>(resolve => (entered = resolve));
+    const real = repo[method].bind(repo) as (...args: unknown[]) => Promise<unknown>;
+    jest.spyOn(repo, method).mockImplementationOnce((async (...args: unknown[]) => {
+      entered();
+      await gate;
+      return real(...args);
+    }) as never);
+    return { release, reached };
+  }
+
+  // SQLite in memory; on PostgreSQL (DATABASE_TYPE=postgres, the test-postgres job) a schema of its own, on
+  // the search_path as the app sets it, since the statements differ by dialect.
+  const pg = process.env.DATABASE_TYPE === 'postgres';
+  const server = {
+    type: 'postgres' as const,
+    host: process.env.DATABASE_HOST || 'localhost',
+    port: Number(process.env.DATABASE_PORT || 5432),
+    username: process.env.DATABASE_USERNAME || 'openwa',
+    password: process.env.DATABASE_PASSWORD || 'openwa',
+    database: process.env.DATABASE_NAME || 'openwa',
+  };
+  let schema = '';
+  const onServer = async (sql: string): Promise<void> => {
+    const admin = await new DataSource(server).initialize();
+    await admin.query(sql).finally(() => admin.destroy());
+  };
+
+  beforeEach(async () => {
+    const entities = [LidMapping, Session];
+    if (pg) {
+      schema = `lid_store_${randomUUID().replace(/-/g, '')}`;
+      await onServer(`CREATE SCHEMA "${schema}"`);
+    }
+    ds = await new DataSource(
+      pg
+        ? { ...server, schema, extra: { options: `-c search_path=${schema},public` }, entities, synchronize: true }
+        : { type: 'better-sqlite3', database: ':memory:', entities, synchronize: true },
+    ).initialize();
+    await ds.getRepository(Session).insert([s1, s2, s3, s9].map(id => ({ id, name: id, phone: `6290000000${id[7]}` })));
+    repo = ds.getRepository(LidMapping);
+    store = new LidMappingStoreService(repo);
+    clock = 0;
+    (store as unknown as { now: () => number }).now = () => clock;
+    // A statement that fails is only logged, which would let a case pass on a write that never ran.
+    warn = jest.spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn');
+    await store.onModuleInit();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+    if (pg) await onServer(`DROP SCHEMA "${schema}" CASCADE`);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('records a negative for a lid with no row', async () => {
+    await store.remember('333', null, s1);
+
+    expect(await row('333')).toMatchObject({ phone: null, sessionId: s1 });
+    expect(await store.findPhoneForLid('333@lid')).toBeNull();
+  });
+
+  it('leaves the phone another session stored, in the table and in the cache', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    expect(store.getCached('111')).toBe('628111');
+    expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
+  });
+
+  it('clears the phone when the session that stored it answers no phone (#1058)', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('111', null, s1);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s1 });
+    expect(store.lidsForPhone('628111')).toEqual([]);
+    expect(store.getCached('111')).not.toBe('628111');
+    expect(await store.findPhoneForLid('111@lid')).toBeNull();
+  });
+
+  it('clears a phone that no session owns', async () => {
+    await repo.save({ lid: '111', phone: '628111', sessionId: null });
+    await store.reload();
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+  });
+
+  it('clears a phone stored by a session that no longer exists', async () => {
+    await repo.save({ lid: '111', phone: '628111', sessionId: gone });
+    await store.reload();
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+    expect(store.lidsForPhone('628111')).toEqual([]);
+    expect(await store.findPhoneForLid('111@lid')).toBeNull();
+  });
+
+  it('clears a phone stored by a session that has since logged out', async () => {
+    await store.remember('111', '628111', s1);
+    await ds.getRepository(Session).update({ id: s1 }, { phone: null }); // logout, or WhatsApp unlinked it
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+    expect(await store.findPhoneForLid('111@lid')).toBeNull();
+  });
+
+  it('keeps it again once that session is linked again', async () => {
+    await store.remember('111', '628111', s1);
+    await ds.getRepository(Session).update({ id: s1 }, { phone: null });
+    await ds.getRepository(Session).update({ id: s1 }, { phone: '629000000001' });
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+  });
+
+  it('touches no other lid, whichever branch would let the negative replace that row', async () => {
+    const stamp = new Date('2020-01-01T00:00:00.000Z');
+    const others = [
+      { lid: '222', phone: '628222', sessionId: null }, // no owner
+      { lid: '444', phone: null, sessionId: s3 }, // holds no phone
+      { lid: '555', phone: '628555', sessionId: gone }, // owned by a deleted session
+      { lid: '777', phone: '628777', sessionId: s9 }, // owned by a session that logged out
+      { lid: '666', phone: '628666', sessionId: s2 }, // owned by the session answering
+    ];
+    await repo.insert([
+      { lid: '111', phone: '628111', sessionId: s2, updatedAt: stamp },
+      ...others.map(o => ({ ...o, updatedAt: stamp })),
+    ]);
+    await ds.getRepository(Session).update({ id: s9 }, { phone: null });
+    await store.reload();
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+    for (const other of others) expect(await row(other.lid)).toEqual({ ...other, updatedAt: stamp });
+  });
+
+  it('drops a phone cached here once the table holds none, whichever session cleared it', async () => {
+    await store.remember('111', '628111', s1);
+    await repo.update({ lid: '111' }, { phone: null }); // s1 answered no phone on another node
+
+    await store.remember('111', null, s2);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+    expect(store.lidsForPhone('628111')).toEqual([]);
+  });
+
+  it('lets a later session clear a phone once the session that stored it is released', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('222', '628222', s9);
+    const stamp = new Date('2020-01-01T00:00:00.000Z');
+    await repo.update({ lid: '111' }, { updatedAt: stamp });
+
+    await store.releaseSession(s1);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: null, updatedAt: stamp });
+    expect(await row('222')).toMatchObject({ phone: '628222', sessionId: s9 });
+    await store.remember('111', null, s2);
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+  });
+
+  it('releaseSession never throws', async () => {
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('connection lost'));
+
+    await expect(store.releaseSession(s1)).resolves.toBeUndefined();
+    warn.mockClear();
+  });
+
+  it('gives a released row back to a session that reported its phone before, on its next report', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('111', '628111', s2);
+    await ds.getRepository(Session).delete({ id: s2 });
+    await store.releaseSession(s2);
+
+    await store.remember('111', '628111', s1);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    await store.remember('111', null, s3);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    expect(await store.findPhoneForLid('111@lid')).toBe('628111');
+    expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
+  });
+
+  it('does so when the release could not write the table as well', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('111', '628111', s2);
+    await ds.getRepository(Session).delete({ id: s2 });
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('connection lost'));
+    await store.releaseSession(s2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+
+    await store.remember('111', '628111', s1);
+    await store.remember('111', null, s3);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+  });
+
+  it('a phone from any session still replaces the row', async () => {
+    await store.remember('111', null, s1);
+    await store.remember('111', '628111', s2);
+    await store.remember('111', '628222', s3);
+
+    expect(await row('111')).toMatchObject({ phone: '628222', sessionId: s3 });
+  });
+
+  it('gives the row to a second session that reports the same phone, so the first one no longer clears it', async () => {
+    await store.remember('111', '628111', s1);
+    await store.remember('111', '628111', s2);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+
+    await store.remember('111', null, s1);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+    expect(store.getCached('111')).toBe('628111');
+
+    await store.remember('111', null, s2);
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s2 });
+  });
+
+  it('writes a phone each session keeps reporting once, not once per report', async () => {
+    const upsert = jest.spyOn(repo, 'upsert');
+    for (let i = 0; i < 50; i++) {
+      await store.remember('111', '628111', s1);
+      await store.remember('111', '628111', s2);
+    }
+
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+  });
+
+  it('forgets who reported a phone once the phone changes or is cleared', async () => {
+    const seenBy = (store as unknown as { seenBy: Map<string, Set<string>> }).seenBy;
+    await store.remember('111', '628111', s1);
+    await store.remember('111', '628111', s2);
+    await store.remember('111', '628222', s3);
+    await store.remember('111', '628222', s1); // s1 reported the old phone, not this one
+
+    expect(await row('111')).toMatchObject({ phone: '628222', sessionId: s1 });
+    await store.remember('111', null, s1);
+    expect(seenBy.has('111')).toBe(false);
+  });
+
+  it('knows the owner of a row it loaded, so only another session reporting the phone writes', async () => {
+    await repo.insert({ lid: '111', phone: '628111', sessionId: s1 });
+    await store.reload();
+    const upsert = jest.spyOn(repo, 'upsert');
+
+    await store.remember('111', '628111', s1);
+    expect(upsert).not.toHaveBeenCalled();
+    await store.remember('111', '628111', s2);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+  });
+
+  it('knows the owner of a row it warms on a miss as well', async () => {
+    await repo.insert({ lid: '111', phone: '628111', sessionId: s1 }); // stored after this node loaded the table
+    for (let i = 0; i < 100 && store.getCached('111') === undefined; i++) await new Promise(r => setTimeout(r, 5));
+    const upsert = jest.spyOn(repo, 'upsert');
+
+    await store.remember('111', '628111', s1);
+    expect(upsert).not.toHaveBeenCalled();
+    await store.remember('111', '628111', s2);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes the row on the next report when taking it failed to write', async () => {
+    await store.remember('111', '628111', s1);
+    jest.spyOn(repo, 'upsert').mockRejectedValueOnce(new Error('connection lost'));
+    await expect(store.remember('111', '628111', s2)).resolves.toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+
+    later(60_000);
+    await store.remember('111', '628111', s2);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+    await store.remember('111', null, s1);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+  });
+
+  it('writes a new phone on the next report when its first write failed', async () => {
+    jest.spyOn(repo, 'upsert').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628111', s1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+    expect(await row('111')).toBeNull();
+
+    later(60_000);
+    await store.remember('111', '628111', s1);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+  });
+
+  it('writes a phone at most once a minute while its writes keep failing, from any session', async () => {
+    const upsert = jest.spyOn(repo, 'upsert').mockRejectedValue(new Error('database or disk is full'));
+    for (let i = 0; i < 1000; i++) await store.remember('111', '628111', i % 2 ? s1 : s2);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    later(59_999);
+    await expect(store.remember('111', '628111', s1)).resolves.toBe(false);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    later(1);
+    await expect(store.remember('111', '628111', s1)).resolves.toBe(false);
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockClear();
+
+    upsert.mockRestore(); // the database takes writes again
+    later(60_000);
+    await expect(store.remember('111', '628111', s1)).resolves.toBe(true);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    await expect(store.remember('111', '628111', s1)).resolves.toBe(true); // already counted: nothing to write
+    await store.remember('111', '628111', s2);
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+  });
+
+  it('holds back only the phone whose write failed, and only until a negative clears the row', async () => {
+    jest.spyOn(repo, 'upsert').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628111', s1);
+    warn.mockClear();
+    await store.remember('111', '628222', s1);
+    expect(await row('111')).toMatchObject({ phone: '628222', sessionId: s1 });
+
+    jest.spyOn(repo, 'upsert').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('222', '628111', s1);
+    warn.mockClear();
+    await store.remember('222', null, s1);
+    await store.remember('222', '628111', s1);
+    expect(await row('222')).toMatchObject({ phone: '628111', sessionId: s1 });
+  });
+
+  it('writes a phone change on every report until the table takes it, warning once a minute', async () => {
+    await store.remember('111', '628111', s1);
+    const upsert = jest.spyOn(repo, 'upsert').mockRejectedValue(new Error('connection lost'));
+    for (let i = 0; i < 5; i++) await store.remember('111', '628222', s1);
+    expect(upsert).toHaveBeenCalledTimes(5);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    later(60_000);
+    await store.remember('111', '628222', s1);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('(4 more failed since the last warning)'));
+    warn.mockClear();
+
+    upsert.mockRestore();
+    await store.remember('111', '628222', s1);
+    expect(await row('111')).toMatchObject({ phone: '628222', sessionId: s1 });
+
+    // Once it lands, a failed write of that phone waits again.
+    const retake = jest.spyOn(repo, 'upsert').mockRejectedValue(new Error('connection lost'));
+    await store.remember('111', '628222', s2);
+    await store.remember('111', '628222', s2);
+    expect(retake).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+  });
+
+  it('writes a negative again when its first attempt failed', async () => {
+    await store.remember('111', '628111', s1);
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('connection lost'));
+    await expect(store.remember('111', null, s1)).resolves.toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+
+    await expect(store.remember('111', null, s1)).resolves.toBe(true);
+
+    expect(await row('111')).toMatchObject({ phone: null, sessionId: s1 });
+    expect(await store.findPhoneForLid('111@lid')).toBeNull();
+  });
+
+  it('takes the row on the next report of a session whose negative failed to write', async () => {
+    await store.remember('111', '628111', s2);
+    await store.remember('111', '628111', s1);
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', null, s2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockClear();
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+
+    await store.remember('111', '628111', s2);
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s2 });
+  });
+
+  it('answers the table again once a negative clears the row, and a failed negative changes nothing', async () => {
+    jest.spyOn(repo, 'upsert').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('111', '628111', s1); // a first write that fails: the cache holds an unstored phone
+    await store.remember('111', null, s1); // the negative lands and clears the row
+    await store.remember('222', '628222', s1);
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('connection lost'));
+    await store.remember('222', null, s1); // fails
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockClear();
+    expect(store.getCached('111')).toBeUndefined(); // warms the cleared row back
+    for (let i = 0; i < 100 && store.getCached('111') === undefined; i++) await new Promise(r => setTimeout(r, 5));
+
+    await repo.update({ lid: In(['111', '222']) }, { phone: '628999' }); // another node stores a phone for both
+    expect(await store.phonesForLidsPersisted(['111', '222'])).toEqual({ 111: '628999', 222: '628999' });
+  });
+
+  it('keeps a phone stored while the negative of another session is being written', async () => {
+    const update = hold('update');
+    const negative = store.remember('111', null, s2);
+    await update.reached; // the row exists (holding no phone); the conditional update has not run
+    await store.remember('111', '628111', s1);
+    update.release();
+    await negative;
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    expect(store.getCached('111')).toBe('628111');
+  });
+
+  it('does not cache a negative over a phone still being written', async () => {
+    const upsert = hold('upsert');
+    const phone = store.remember('111', '628111', s1);
+    await upsert.reached;
+    await store.remember('111', null, s2); // lands first: there is no row yet
+    upsert.release();
+    await phone;
+
+    expect(await row('111')).toMatchObject({ phone: '628111', sessionId: s1 });
+    expect(store.getCached('111')).not.toBeNull();
+    expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
   });
 });

@@ -1936,6 +1936,17 @@ describe('BaileysAdapter messaging', () => {
     expect(countsTowardSendBreaker(error)).toBe(false);
   });
 
+  // The library's own write timeout (promiseTimeout) carries statusCode 408 and an object data, not a numeric
+  // WhatsApp code. Its frame may already be on the socket, so it must not become a retryable 503.
+  it('leaves the local socket-write timeout of a send unmapped', async () => {
+    const adapter = await readyAdapter();
+    const timedOut = new Boom('Timed Out', { statusCode: 408, data: { stack: 'Error\n    at x' } });
+    fakeSock.sendMessage.mockRejectedValue(timedOut);
+    const rejection = adapter.sendTextMessage('628111@s.whatsapp.net', 'hello');
+    await expect(rejection).rejects.toBe(timedOut);
+    await expect(rejection).rejects.not.toBeInstanceOf(EngineTransportError);
+  });
+
   it('leaves any other WhatsApp refusal code to propagate untouched', async () => {
     const adapter = await readyAdapter();
     const refusal = new Boom('forbidden', { data: 403 });
@@ -6825,7 +6836,7 @@ describe('BaileysAdapter contact + chat reads', () => {
       getCached: jest.fn((): string | null | undefined => undefined),
       resolveLid: jest.fn(() => null),
       lidsForPhone: jest.fn((): string[] => []),
-      remember: jest.fn(() => Promise.resolve()),
+      remember: jest.fn(() => Promise.resolve(true)),
       findPhoneForLid: jest.fn((): Promise<string | null> => Promise.resolve(null)),
     });
     const readyWith = async (lidMappingStore: ReturnType<typeof makeLidStore>): Promise<BaileysAdapter> => {
@@ -9787,10 +9798,10 @@ describe('BaileysAdapter keeps the message store in step with edits and deletes'
         expect(warn).not.toHaveBeenCalledWith(dropped, expect.anything());
       });
 
-      it('does not hold an edit from the chat the delivery arrived in', async () => {
+      it('does not hold an edit from the chat the delivery arrived in for the answer', async () => {
         const callbacks = sessionCallbacks();
         await startWith({ onMessage: jest.fn(() => ({ settled: answer().promise })), ...callbacks });
-        holdReads([1]);
+        const open = holdReads([1]);
         deliverReuse();
         await settleAll();
 
@@ -9798,6 +9809,10 @@ describe('BaileysAdapter keeps the message store in step with edits and deletes'
           { id: 'OWN_EDIT_ENV', remoteJid: OTHER, fromMe: false },
           { key: { id: 'REUSED' }, type: 14, editedMessage: { conversation: 'late, edited' } },
         );
+        await settleAll();
+        // It follows the delivery's emit, which the answer of the session does not hold up.
+        expect(callbacks.onMessageEdited).not.toHaveBeenCalled();
+        open(1);
         await settleAll();
 
         expect(callbacks.onMessageEdited).toHaveBeenCalledTimes(1);
@@ -10335,8 +10350,9 @@ describe('BaileysAdapter keeps the message store in step with edits and deletes'
 
       answered.resolve({ conflict });
       await settleAll();
-      expect(onMessageEdited).toHaveBeenCalledTimes(conflict ? 1 : 0);
       expect(warn.mock.calls.filter(([message]) => message === dropped)).toHaveLength(conflict ? 0 : 1);
+      // The real edit is judged, but follows the delivery that is still being processed.
+      expect(onMessageEdited).not.toHaveBeenCalled();
 
       openFirst();
       await settleAll();
@@ -10506,6 +10522,10 @@ describe('BaileysAdapter group metadata cache', () => {
     ['a participant is added or removed', 'group-participants.update', { id: GROUP, action: 'add', participants: [] }],
     ['the group changes a setting', 'groups.update', [{ id: GROUP, announce: true }]],
     ['the account is added to the group again', 'groups.upsert', [{ id: GROUP, participants: [] }]],
+    // Baileys reports a disappearing-messages change made on the phone as a chat update only, and the
+    // timer on the cached list is what a group send stamps on its stanza.
+    ['its disappearing-messages timer is changed', 'chats.update', [{ id: GROUP, ephemeralExpiration: 86400 }]],
+    ['its disappearing-messages timer is switched off', 'chats.update', [{ id: GROUP, ephemeralExpiration: null }]],
   ])('reads the group again after %s', async (_label, event, payload) => {
     await ready();
     const { cachedGroupMetadata } = socketConfig();
@@ -10517,16 +10537,35 @@ describe('BaileysAdapter group metadata cache', () => {
     expect(fakeSock.groupMetadata).toHaveBeenCalledTimes(2);
   });
 
-  it('refreshes a cached group from a whole snapshot without another query', async () => {
+  it('keeps a cached group through the chat updates that every message raises', async () => {
     await ready();
     const { cachedGroupMetadata } = socketConfig();
     await cachedGroupMetadata(GROUP);
 
-    fakeSock.fire('groups.update', [meta(['628111@s.whatsapp.net', '628222@s.whatsapp.net'])]);
-    const refreshed = (await cachedGroupMetadata(GROUP)) as { participants: unknown[] };
+    fakeSock.fire('chats.update', [{ id: GROUP, unreadCount: 3, conversationTimestamp: 1_700_000_000 }]);
+    await cachedGroupMetadata(GROUP);
 
-    expect(refreshed.participants).toHaveLength(2);
     expect(fakeSock.groupMetadata).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds the next send from the single-group query, not from a whole snapshot of the group list', async () => {
+    const queried = {
+      ...meta(['159442138038327@lid']),
+      addressingMode: 'lid',
+      ephemeralDuration: 86400,
+    };
+    fakeSock.groupMetadata.mockResolvedValue(queried);
+    await ready();
+    const { cachedGroupMetadata } = socketConfig();
+    await cachedGroupMetadata(GROUP);
+
+    // The all-groups listing can name participants in another id form and leave out the addressing mode
+    // and the disappearing timer; it must not become what the next group send is built from.
+    fakeSock.fire('groups.update', [meta(['628111@s.whatsapp.net', '628222@s.whatsapp.net'])]);
+    const next = await cachedGroupMetadata(GROUP);
+
+    expect(next).toBe(queried);
+    expect(fakeSock.groupMetadata).toHaveBeenCalledTimes(2);
   });
 
   it('still reports the group events to consumers while it keeps the cache', async () => {
@@ -10583,6 +10622,24 @@ describe('BaileysAdapter group metadata cache', () => {
     });
     await jest.runAllTimersAsync();
     await socketConfig().cachedGroupMetadata(GROUP);
+
+    expect(fakeSock.groupMetadata).toHaveBeenCalledTimes(2);
+    await adapter.destroy();
+  });
+
+  it('asks a new socket for a group whose query never came back on the previous one', async () => {
+    const adapter = await ready();
+    // A socket ended on a silent connection loss leaves a query still out on it unanswered.
+    fakeSock.groupMetadata.mockReturnValueOnce(new Promise(() => undefined));
+    void socketConfig().cachedGroupMetadata(GROUP);
+
+    jest.useFakeTimers();
+    fakeSock.fire('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+    await jest.runAllTimersAsync();
+    void socketConfig().cachedGroupMetadata(GROUP);
 
     expect(fakeSock.groupMetadata).toHaveBeenCalledTimes(2);
     await adapter.destroy();

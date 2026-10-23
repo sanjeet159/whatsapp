@@ -36,6 +36,10 @@ const matches = (row: Row, where: Record<string, unknown>): boolean =>
     const op = want as { _type?: string; _value?: unknown } | null;
     if (op && typeof op === 'object' && op._type === 'not') return row[key] !== op._value;
     if (op && typeof op === 'object' && op._type === 'in') return (op._value as unknown[]).includes(row[key]);
+    if (op && typeof op === 'object' && op._type === 'or') {
+      return (op._value as unknown[]).some(alternative => matches(row, { [key]: alternative }));
+    }
+    if (op && typeof op === 'object' && op._type === 'isNull') return row[key] == null;
     return row[key] === want;
   });
 
@@ -258,8 +262,123 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
     const calls = hookManager.execute.mock.calls as Array<[string, IncomingMessage]>;
     const hooked = calls.find(c => c[0] === 'message:received')?.[1];
     expect(hooked?.body).toBe('edited');
-    expect(rows[0]).toEqual(expect.objectContaining({ body: 'edited' }));
+    expect(rows[0]).toEqual(expect.objectContaining({ body: 'edited', metadata: { edited: true } }));
+    // The row `message:persisted` hands out is the one the edit left, marker included.
+    expect(persistedHooks()[0]).toEqual(expect.objectContaining({ body: 'edited', metadata: { edited: true } }));
     expect(dispatched('message.received')[0]).toEqual(expect.objectContaining({ body: 'edited' }));
+  });
+
+  // An edit that repeats the text the message carries changes nothing, so it leaves no mark, though it is announced.
+  it.each([
+    ['before the emit', false],
+    ['after the emit, while the insert is out', true],
+  ])('leaves an edit that repeats the text unmarked, %s', async (_when, afterEmit) => {
+    const stall = deferred<void>();
+    if (afterEmit) insertGate = () => stall.promise;
+    const t = admit(arrival('A', 'chat1'));
+    if (!afterEmit) projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'original' } as never);
+    projector.handleInboundMessage('s1', engine, message('A', 'chat1', { body: 'original' }), t);
+    if (afterEmit) {
+      await flush();
+      projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'original' } as never);
+      await flush();
+      stall.resolve();
+    }
+    await flush();
+
+    expect(rows).toEqual([expect.objectContaining({ body: 'original', metadata: undefined })]);
+    expect(persistedHooks()[0]).toEqual(expect.objectContaining({ body: 'original', metadata: undefined }));
+    expect(eventsGateway.emitMessageEdited).toHaveBeenCalledTimes(1);
+    expect(eventsGateway.emitMessage).toHaveBeenCalledTimes(1);
+    const [[, announced]] = eventsGateway.emitMessage.mock.calls as Array<[string, Record<string, unknown>]>;
+    expect(announced).not.toHaveProperty('edited');
+  });
+
+  it('marks an edit that restores the text after another one, before the emit', async () => {
+    const t = admit(arrival('A', 'chat1'));
+    projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'v1' } as never);
+    projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'original' } as never);
+    projector.handleInboundMessage('s1', engine, message('A', 'chat1', { body: 'original' }), t);
+    await flush();
+
+    expect(rows).toEqual([expect.objectContaining({ body: 'original', metadata: { edited: true } })]);
+  });
+
+  // The engine applied the edit and told the session of it before the hand-over, so the message is handed over
+  // already edited, with the text it arrived with beside it.
+  it('compares an edit held before the emit with the text the message arrived with', async () => {
+    const t = admit(arrival('A', 'chat1'));
+    projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'fixed' } as never);
+    projector.handleInboundMessage('s1', engine, message('A', 'chat1', { body: 'fixed', originalBody: 'original' }), t);
+    const same = admit(arrival('B', 'chat1'));
+    projector.applyMessageEditQueued('s1', { messageId: 'B', body: 'original' } as never);
+    projector.handleInboundMessage('s1', engine, message('B', 'chat1', { body: 'original' }), same);
+    await flush();
+
+    expect(rows).toEqual([
+      expect.objectContaining({ waMessageId: 'A', body: 'fixed', metadata: { edited: true } }),
+      expect.objectContaining({ waMessageId: 'B', body: 'original', metadata: undefined }),
+    ]);
+    // The webhook and the socket are told alike.
+    const received = (webhookService.dispatch.mock.calls as Array<[string, string, Record<string, unknown>]>)
+      .filter(([, event]) => event === 'message.received')
+      .map(([, , payload]) => payload);
+    expect(received).toEqual([expect.objectContaining({ id: 'A', body: 'fixed', edited: true }), expect.anything()]);
+    expect(received[1]).toEqual(expect.objectContaining({ id: 'B', body: 'original' }));
+    expect(received[1]).not.toHaveProperty('edited');
+    const emitted = eventsGateway.emitMessage.mock.calls as Array<[string, Record<string, unknown>]>;
+    expect(emitted.map(([, payload]) => payload)).toEqual(received);
+  });
+
+  // An engine names the text the message arrived with only when the edit it applied changed it.
+  it('stores a message the engine handed over edited as marked, though no edit was held for it', async () => {
+    const t = admit(arrival('A', 'chat1'));
+    projector.handleInboundMessage('s1', engine, message('A', 'chat1', { body: 'fixed', originalBody: 'original' }), t);
+    await flush();
+
+    expect(rows).toEqual([expect.objectContaining({ waMessageId: 'A', body: 'fixed', metadata: { edited: true } })]);
+    expect(persistedHooks()[0]).toEqual(expect.objectContaining({ body: 'fixed', metadata: { edited: true } }));
+    const [[, announced]] = eventsGateway.emitMessage.mock.calls as Array<[string, Record<string, unknown>]>;
+    expect(announced).toEqual(expect.objectContaining({ body: 'fixed', edited: true }));
+  });
+
+  it('marks a message edited while its insert is out, where nothing holds the arrival (SQLite)', async () => {
+    build('better-sqlite3');
+    const stall = deferred<void>();
+    insertGate = () => stall.promise;
+    projector.handleInboundMessage('s1', engine, message('A', 'chat1', { body: 'original' }));
+    await flush();
+    projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'edited' } as never);
+    await flush();
+    stall.resolve();
+    await flush();
+
+    expect(rows).toEqual([expect.objectContaining({ body: 'edited', metadata: { edited: true } })]);
+  });
+
+  // A REST edit of a send the account's phone composed reaches the echo while it waits for its row.
+  describe.each([
+    ['PostgreSQL', 'postgres'],
+    ['SQLite', 'better-sqlite3'],
+  ])('an own-send echo that a REST edit reaches before its row is written, on %s', (_name, type) => {
+    const CHAT = '15550001111@c.us';
+
+    it('stores the row with the edit and its marker', async () => {
+      build(type);
+      const hook = deferred<void>();
+      hookManager.execute.mockImplementationOnce(async (_event: string, data: unknown) => {
+        await hook.promise;
+        return { continue: true, data };
+      });
+      const ticket = type === 'postgres' ? admit(arrival('A', CHAT, false, false, true)) : undefined;
+      projector.handleOwnSendEcho('s1', engine, message('A', CHAT, { fromMe: true, body: 'sent' }), ticket);
+      await flush();
+      await projector.recordOutboundMessageEdit('s1', 'A', 'rest edit', { kind: 'edit', chatId: CHAT, fromMe: true });
+      hook.resolve();
+      await flush();
+
+      expect(rows).toEqual([expect.objectContaining({ body: 'rest edit', metadata: { edited: true } })]);
+    });
   });
 
   // The entry exists from the arrival, and a change that names another chat or the other party has to be
@@ -704,13 +823,24 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
       expect(dispatched('message.sent')).toHaveLength(1);
     };
 
-    it('writes the edit recorded for the echo onto the row', async () => {
+    it('writes the edit recorded for the echo onto the row, marked edited', async () => {
       await lose(
         () => edit('v1'),
         () => undefined,
       );
 
       expect(rows[0].body).toBe('v1');
+      expect((rows[0].metadata as Row).edited).toBe(true);
+    });
+
+    it('writes the REST edit recorded for the echo onto the row, marked edited', async () => {
+      await lose(
+        () => void projector.recordOutboundMessageEdit('s1', 'A', 'v1', { kind: 'edit', chatId: CHAT, fromMe: true }),
+        () => undefined,
+      );
+
+      expect(rows[0].body).toBe('v1');
+      expect((rows[0].metadata as Row).edited).toBe(true);
     });
 
     it('writes the reaction recorded for the echo onto the row', async () => {
@@ -729,6 +859,7 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
       );
 
       expect(rows[0].body).toBe('v2');
+      expect((rows[0].metadata as Row).edited).toBe(true);
       expect(
         (eventsGateway.emitMessageEdited.mock.calls as Array<[string, { body: string }]>).map(c => c[1].body),
       ).toEqual(['v1', 'v2']);
@@ -836,7 +967,9 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
     await flush();
 
     expect(rows.find(r => r.waMessageId === 'A')).toEqual(expect.objectContaining({ body: '', type: 'revoked' }));
-    expect(rows.find(r => r.waMessageId === 'B')).toEqual(expect.objectContaining({ body: 'rest edit' }));
+    expect(rows.find(r => r.waMessageId === 'B')).toEqual(
+      expect.objectContaining({ body: 'rest edit', metadata: { edited: true } }),
+    );
     // A delete for me: the message still exists for its sender, so it is announced as revoked.
     expect(dispatched('message.received').map(m => [m.id, m.type, m.body])).toEqual([
       ['A', 'revoked', ''],

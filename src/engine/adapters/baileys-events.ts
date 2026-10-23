@@ -56,7 +56,7 @@ import type { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter'
 import { type createLogger } from '../../common/services/logger.service';
 import { createSilentLogger } from './baileys-logger';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
-import { parseWaId, userPart } from '../identity/wa-id';
+import { chatKind, parseWaId, userPart, type ChatKind } from '../identity/wa-id';
 
 /**
  * Inbound event handling extracted from BaileysAdapter: the socket event handlers
@@ -95,6 +95,12 @@ const PRESENCE_STATES: ReadonlySet<PresenceState> = new Set<PresenceState>([
   'recording',
   'paused',
 ]);
+
+/**
+ * The chats a per-recipient receipt is reported for: the two Baileys raises message-receipt.update for, and the
+ * only ones message.receipt is documented for. A 1:1 chat reports through messages.update instead.
+ */
+const RECEIPT_CHAT_KINDS: ReadonlySet<ChatKind> = new Set<ChatKind>(['group', 'status']);
 
 /**
  * Top-level Message keys that carry no user content. A live message made only of these is dropped;
@@ -330,10 +336,14 @@ export class BaileysEvents {
    * The latest edit of a message still being processed, by id, with the key it was sent under. The
    * edit is announced first and finds no row or preview to change, and a repeat delivery can be stored
    * after the edit was applied, so the original is stored and announced with this text instead, and
-   * a quote or forward meanwhile carries it too (see pendingEditOf). Dropped once the message's
-   * processing settles, and bounded like deletedForEveryone, which wins over it.
+   * a quote or forward meanwhile carries it too (see pendingEditOf). `afterOtherText` says an earlier
+   * edit had another text, so one of them changed the text even if this one restores it. Dropped once
+   * the message's processing settles, and bounded like deletedForEveryone, which wins over it.
    */
-  private readonly editedWhileInFlight = new Map<string, { envelope: WAMessageKey; body: string }>();
+  private readonly editedWhileInFlight = new Map<
+    string,
+    { envelope: WAMessageKey; body: string; afterOtherText: boolean }
+  >();
 
   /**
    * The deliveries of an id handed to onMessage that have no outcome yet, by id: how many, and a promise
@@ -346,8 +356,26 @@ export class BaileysEvents {
    */
   private readonly outcomesPending = new Map<string, { count: number; ended: Promise<void>; free: () => void }>();
 
+  /**
+   * Reactions, edits and deletes that reached a message still being processed where nothing is admitted before
+   * the emit (SQLite), by its id, in the order they arrived, with the timer that lets them go if the message is
+   * never handed on. The session holds no entry for such a message until it is emitted, so a reaction announced
+   * earlier is stored nowhere and an edit leaves no marker: they are announced right after the emit instead (see
+   * announceWhenHandedOn).
+   */
+  private readonly changesAwaitingEmit = new Map<
+    string,
+    { announce: Array<() => void>; timer: ReturnType<typeof setTimeout> }
+  >();
+
   /** How many changes wait for a delivery or its outcome (see parkUntil); the rest are judged at once. */
   private changesParked = 0;
+
+  /**
+   * How many changes wait in changesAwaitingEmit; the rest are announced at once. Counted apart from the parks,
+   * so changes waiting for their message cannot make a change that has to wait for an outcome be dropped.
+   */
+  private changesAwaiting = 0;
 
   private static readonly CHANGES_PARKED_LIMIT = 64;
 
@@ -421,6 +449,16 @@ export class BaileysEvents {
       if (!msg.message || !msg.key?.remoteJid) {
         continue; // protocol/empty messages carry no neutral content
       }
+      // A receipt that arrives while this message's own upsert is still in Baileys' event buffer is merged
+      // into the upsert and raised as no message-receipt.update, which the echo skip below would then drop
+      // with the rest of the echo.
+      if (msg.userReceipt?.length) {
+        this.handleMessageReceiptUpdate(msg.userReceipt.map(receipt => ({ key: msg.key, receipt })));
+      }
+      // The same buffer merges a 1:1 delivery or read ack, or a rejection by the server, into the upsert as
+      // `status` and raises no messages.update. What a message carries before any ack (PENDING on an echo,
+      // SERVER_ACK on one the phone typed) maps to pending or sent and is not one.
+      const mergedAck = this.mergedAck(msg);
       // Baileys echoes every message this session sends through the API back through this same
       // path, tagged 'append', and sendContent() already emits onMessageCreate for those via
       // emitOwnSendEcho(). WhatsApp replays what the account typed on its phone while the gateway
@@ -443,6 +481,9 @@ export class BaileysEvents {
       // insert oracle both absorb; a loss is not recoverable, because Baileys acks the node before
       // it emits the upsert.
       if (msg.key.fromMe === true && this.host.consumeOwnSend(msg.key.id)) {
+        // The send returned about 100 ms ago (the buffer holds the upsert that long), so the message
+        // already has its row, or its entry in the projector.
+        if (mergedAck) this.handleMessagesUpdate([mergedAck]);
         this.host.logger.debug('Skipping the echo of a message this session sent', {
           msgId: msg.key.id ?? 'unknown',
           type: event.type,
@@ -490,6 +531,9 @@ export class BaileysEvents {
       // The room stays held until the processing settles too, and a message never emitted drops its turn.
       ticket?.holdUntil(processed);
       void processed.finally(() => ticket?.drop());
+      // A message the phone typed is created by that processing, and an ack that reached the projector
+      // first would find nothing to advance, so it waits until the message was handed on.
+      if (mergedAck) void processed.then(() => this.handleMessagesUpdate([mergedAck]));
       const id = msg.key.id;
       if (id) {
         // A repeat delivery can arrive while the first is still downloading and finish before it, so
@@ -505,9 +549,23 @@ export class BaileysEvents {
           this.inboundInFlight.delete(id);
           // The edit's store write was chained behind this, so the store carries it (or a newer one) now.
           this.editedWhileInFlight.delete(id);
+          // A change that came in after the message was handed on, while it still counted as in flight.
+          this.handOverChanges(id);
         });
       }
     }
+  }
+
+  /** The ack Baileys' event buffer merged into the upsert of a message the account sent, as an update. */
+  private mergedAck(msg: WAMessage): BaileysMessageUpdate | undefined {
+    if (msg.key.fromMe !== true) return undefined;
+    const status = mapBaileysStatus(msg.status);
+    // A delivery or read ack is a 1:1 event (groups and statuses report receipts instead); the server
+    // rejecting a message is reported for every kind of chat.
+    const reported =
+      status === 'failed' ||
+      ((status === 'delivered' || status === 'read') && chatKind(msg.key.remoteJid!) === 'individual');
+    return reported ? { key: msg.key, update: { status: msg.status } } : undefined;
   }
 
   /**
@@ -667,7 +725,14 @@ export class BaileysEvents {
           this.changeStoredMessage(pm.key?.id, stored =>
             this.mayChange(stored.key, msg.key, true) ? { ...stored, message: null } : null,
           );
-          this.host.getOnMessageRevoked()?.(revoked, { fromMe: msg.key.fromMe === true });
+          // Behind the reactions and edits of the message that wait for its emit, never for the message itself:
+          // the delete keeps it from being emitted, and they were made before it.
+          this.announceWhenHandedOn(
+            revoked.id,
+            opts.ticket,
+            () => this.host.getOnMessageRevoked()?.(revoked, { fromMe: msg.key.fromMe === true }),
+            true,
+          );
           return;
         }
         if (pm?.type === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
@@ -712,8 +777,10 @@ export class BaileysEvents {
           this.host.recordMessageEdit(chatJid, edited.messageId, edited.body);
           const target = this.inboundInFlight.get(edited.messageId);
           if (target && this.mayChange(target.key, msg.key, false)) {
+            const earlier = this.editedWhileInFlight.get(edited.messageId);
+            const afterOtherText = !!earlier && (earlier.afterOtherText || earlier.body !== edited.body);
             this.editedWhileInFlight.delete(edited.messageId); // re-inserted as the newest
-            this.editedWhileInFlight.set(edited.messageId, { envelope: msg.key, body: edited.body });
+            this.editedWhileInFlight.set(edited.messageId, { envelope: msg.key, body: edited.body, afterOtherText });
             if (this.editedWhileInFlight.size > BaileysEvents.DELETED_FOR_EVERYONE_LIMIT) {
               const [oldest] = this.editedWhileInFlight.keys();
               this.editedWhileInFlight.delete(oldest);
@@ -725,7 +792,7 @@ export class BaileysEvents {
               : undefined;
             return content && setBaileysText(content, edited.body) ? stored : null;
           });
-          this.host.getOnMessageEdited()?.(edited);
+          this.announceWhenHandedOn(edited.messageId, opts.ticket, () => this.host.getOnMessageEdited()?.(edited));
           return;
         }
         // Other protocol messages (ephemeral, history sync, etc.) — skip silently.
@@ -747,7 +814,7 @@ export class BaileysEvents {
             keyParticipant(msg.key) ?? (msg.key.fromMe === true ? this.host.normalizedSelfJid() : remoteJid),
           ),
         };
-        this.host.getOnMessageReaction()?.(event);
+        this.announceWhenHandedOn(rm?.key?.id, opts.ticket, () => this.host.getOnMessageReaction()?.(event));
         return;
       }
 
@@ -826,6 +893,11 @@ export class BaileysEvents {
         toStore = JSON.parse(JSON.stringify(msg, b.BufferJSON.replacer), b.BufferJSON.reviver) as WAMessage;
         const content = b.normalizeMessageContent(toStore.message ?? undefined);
         if (content) setBaileysText(content, editedBody);
+        // The session is told of the edit too, with a ticket at once and without one right after the emit, and
+        // compares it with the text the message arrived with. It is told even when the latest edit restored that
+        // text after another one: the message was edited all the same, and edits announced before the emit, past
+        // the changes that wait, left no mark.
+        if (editedBody !== incoming.body || edit?.afterOtherText) incoming.originalBody = incoming.body;
         incoming.body = editedBody;
       }
       if (opts.generation === this.storeGeneration) {
@@ -858,6 +930,61 @@ export class BaileysEvents {
         `Unhandled error processing inbound message (id=${msg.key?.id ?? 'unknown'}); dropping`,
         err instanceof Error ? err.message : String(err),
       );
+    } finally {
+      // Emitted by now, or never to be: what waited for this message goes to the session in the same turn, so
+      // it reaches the message before its row is written.
+      this.handOverChanges(msg.key?.id);
+    }
+  }
+
+  /**
+   * Announce a reaction, an edit or a delete of message `id`. With a ticket the session holds the message from
+   * its arrival and keeps the change for its row, so it is announced at once. Without one the session knows
+   * nothing of a message before its emit, so a change that reaches a message still being processed is announced
+   * right after the emit instead, in the order the changes arrived, when the session holds the message. A delete
+   * (`behindChangesOnly`) never waits for the message: it waits only behind the changes already waiting, so they
+   * are announced in the order they arrived. A change waits at most the three media deadlines a change aimed at a
+   * delivery in flight waits (see targetsForeignMessage), and no more than CHANGES_PARKED_LIMIT wait at once, the
+   * limit of those changes.
+   */
+  private announceWhenHandedOn(
+    messageId: string | null | undefined,
+    ticket: InboundTicket | undefined,
+    announce: () => void,
+    behindChangesOnly = false,
+  ): void {
+    const waiting = messageId && !ticket ? this.changesAwaitingEmit.get(messageId) : undefined;
+    const waits = !!waiting || (!behindChangesOnly && !ticket && !!messageId && this.inboundInFlight.has(messageId));
+    if (!messageId || !waits || this.changesAwaiting >= BaileysEvents.CHANGES_PARKED_LIMIT) {
+      announce();
+      return;
+    }
+    this.changesAwaiting++;
+    if (waiting) {
+      waiting.announce.push(announce);
+      return;
+    }
+    const timer = setTimeout(() => this.handOverChanges(messageId), 3 * inboundMediaTimeoutMs());
+    timer.unref();
+    this.changesAwaitingEmit.set(messageId, { announce: [announce], timer });
+  }
+
+  /** Announce, in order, what waited for message `id` to be handed on (see announceWhenHandedOn). */
+  private handOverChanges(messageId: string | null | undefined): void {
+    const waiting = messageId ? this.changesAwaitingEmit.get(messageId) : undefined;
+    if (!messageId || !waiting) return;
+    this.changesAwaitingEmit.delete(messageId);
+    clearTimeout(waiting.timer);
+    this.changesAwaiting -= waiting.announce.length;
+    for (const announce of waiting.announce) {
+      try {
+        announce();
+      } catch (err) {
+        this.host.logger.warn('Failed to announce a change that waited for its message', {
+          msgId: messageId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -1306,10 +1433,11 @@ export class BaileysEvents {
   /**
    * Baileys `message-receipt.update`: per-participant receipts, which Baileys raises only for group
    * and status messages (1:1 receipts arrive as `messages.update` instead). Only receipts for
-   * messages this account sent are reported, and receipts from the account's own linked devices are
-   * dropped. The event buffer can merge several receipts of one participant into one entry, so each
-   * timestamp the entry carries becomes its own event. rc14 files a `played` receipt under
-   * `readTimestamp`, so on that version a voice note that was played reports `read`.
+   * messages this account sent are reported, and only for those two chat kinds whichever way the list
+   * reached this handler; receipts from the account's own linked devices are dropped. The event
+   * buffer can merge several receipts of one participant into one entry, so each timestamp the entry
+   * carries becomes its own event. rc14 files a `played` receipt under `readTimestamp`, so on that
+   * version a voice note that was played reports `read`.
    */
   handleMessageReceiptUpdate(
     updates: Array<{
@@ -1328,7 +1456,14 @@ export class BaileysEvents {
     }
     const isSelf = this.selfMatcher();
     for (const { key, receipt } of Array.isArray(updates) ? updates : []) {
-      if (!key?.id || !key.remoteJid || key.fromMe !== true || !receipt?.userJid || isSelf(receipt.userJid)) {
+      if (
+        !key?.id ||
+        !key.remoteJid ||
+        key.fromMe !== true ||
+        !RECEIPT_CHAT_KINDS.has(chatKind(key.remoteJid)) ||
+        !receipt?.userJid ||
+        isSelf(receipt.userJid)
+      ) {
         continue;
       }
       const stamps: Array<[MessageReceiptStatus, typeof receipt.receiptTimestamp]> = [

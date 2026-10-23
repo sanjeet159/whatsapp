@@ -6,7 +6,7 @@ import { BAILEYS_QUERY_BUDGET_MS, confirmedWrite, withQueryDeadline } from './ba
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 import { LidNotMappedError } from '../../common/errors/lid-not-mapped.error';
-import { parseWaId, userPart } from '../identity/wa-id';
+import { chatKind, parseWaId, userPart } from '../identity/wa-id';
 import { storedKeyInChat } from './baileys-message-mapper';
 import { refusedStatusCode } from './baileys-groups';
 
@@ -178,7 +178,8 @@ export class BaileysContacts {
    * The read half of block/unblockContact. Bounded by our own clock: Baileys' `query()` swallows
    * its timeout, and an unanswered blocklist query would otherwise surface as an EMPTY blocklist —
    * a claim about the account sold in place of a transport failure. Wire items without a jid attr
-   * are dropped rather than reported as "undefined".
+   * are dropped rather than reported as "undefined". A contact held under both its LID and its phone
+   * is two wire items that read as one id, which is listed once.
    */
   async getBlockedContacts(budgetMs: number = this.queryBudgetMs): Promise<string[]> {
     this.host.ensureReady();
@@ -187,7 +188,8 @@ export class BaileysContacts {
       budgetMs,
       'WhatsApp did not answer the blocklist query in time',
     );
-    return (jids ?? []).filter((jid): jid is string => Boolean(jid)).map(jid => this.host.toNeutralJid(jid));
+    const ids = (jids ?? []).filter((jid): jid is string => Boolean(jid)).map(jid => this.host.toNeutralJid(jid));
+    return [...new Set(ids)];
   }
 
   async setProfileName(name: string): Promise<void> {
@@ -370,9 +372,9 @@ export class BaileysContacts {
     return this.host.listChats();
   }
 
-  async sendSeen(chatId: string, messageIds?: string[]): Promise<boolean> {
+  async sendSeen(chatId: string, messageIds?: string[], authors?: ReadonlyMap<string, string>): Promise<boolean> {
     this.host.ensureReady();
-    const keys = await this.receiptKeys(chatId, messageIds);
+    const keys = await this.receiptKeys(chatId, messageIds, authors);
     if (keys.length === 0) {
       return false; // nothing known to mark read
     }
@@ -398,9 +400,16 @@ export class BaileysContacts {
    * sender; its hardcoded `fromMe: false` is wrong for an id that belongs to an outbound message;
    * and its jid is whichever dialect the caller happened to send. The stored key has all three
    * right. Ids the store has never seen — history backfill is emitted but not persisted — keep the
-   * synthesised key, which is what the 1:1 case ran on before.
+   * synthesised key in a 1:1 chat, which is what that case ran on before. A group receipt that names
+   * no sender cannot be attributed, so there the key takes `authors` (message id to the stored poster,
+   * which the gateway keeps for every group message), and an id with no known author is left out of
+   * the receipt rather than sent as one WhatsApp may ignore.
    */
-  private async receiptKeys(chatId: string, messageIds?: string[]): Promise<WAMessageKey[]> {
+  private async receiptKeys(
+    chatId: string,
+    messageIds?: string[],
+    authors?: ReadonlyMap<string, string>,
+  ): Promise<WAMessageKey[]> {
     // null as well as undefined: the REST body rejects an explicit null, but this is the engine
     // boundary and an internal caller reaching it with one used to dereference it below as a 500.
     if (messageIds === undefined || messageIds === null) {
@@ -430,7 +439,14 @@ export class BaileysContacts {
         )
         .map(msg => [msg.key.id as string, msg.key]),
     );
-    return messageIds.map(id => keyById.get(id) ?? { remoteJid, id, fromMe: false });
+    const inGroup = chatKind(remoteJid) === 'group';
+    return messageIds.flatMap((id): WAMessageKey[] => {
+      const key = keyById.get(id);
+      if (key) return [key];
+      if (!inGroup) return [{ remoteJid, id, fromMe: false }];
+      const author = authors?.get(id);
+      return author ? [{ remoteJid, id, fromMe: false, participant: this.host.toEngineJid(author) }] : [];
+    });
   }
 
   async markUnread(chatId: string): Promise<boolean> {

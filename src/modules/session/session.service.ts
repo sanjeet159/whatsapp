@@ -9,6 +9,7 @@ import {
   OnModuleInit,
   OnApplicationBootstrap,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
@@ -49,7 +50,9 @@ import {
 } from './session-engine-lifecycle.service';
 import { SessionOwnershipService } from './session-ownership.service';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
+import { ListingMemo } from '../../common/utils/listing-memo';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
+import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { resolveFeatureFlags } from '../../config/feature-flags';
 import { IWhatsAppEngine, ChatSummary, ChatState } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
@@ -57,7 +60,8 @@ import { ShutdownService } from '../../common/services/shutdown.service';
 import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { resolveJidCandidates } from '../../engine/identity/jid-candidates';
-import { Message } from '../message/entities/message.entity';
+import { chatKind } from '../../engine/identity/wa-id';
+import { Message, MessageDirection } from '../message/entities/message.entity';
 import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
 // Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
@@ -97,6 +101,19 @@ export const AUTOSTART_SHUTDOWN_WAIT_MS = 5_000;
 /** List window for {@link SessionService.findAll}, plus an optional exact session-name filter. */
 export interface SessionListOptions extends ListOptions {
   name?: string;
+}
+
+/** The deletes of one session running on this node, and the stop record they share; see SessionService.delete. */
+interface DeleteStops {
+  running: number;
+  /** One of them wrote the record on a row that had none. */
+  recorded: boolean;
+  /** One of them began removing the session's data. */
+  removing: boolean;
+  /** An operator stop or a kill recorded a stop while they ran. */
+  overtaken: boolean;
+  /** The last one out taking the record back. */
+  givingBack?: Promise<void>;
 }
 
 /**
@@ -141,6 +158,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * after it began from a mark left over by an earlier stop, which start() clears by design.
    */
   private readonly stopRequests = new Map<string, number>();
+  /** Stop records of stop() and forceKill() being written per session, which may land before a take-back; see delete(). */
+  private readonly stopWritesInFlight = new Map<string, number>();
+  /** Per session, the deletes running here; see delete(). */
+  private readonly deleteStops = new Map<string, DeleteStops>();
   /**
    * Starts past start()'s cap check, held until they return. That check counts them with the
    * engine's slot holders, so two starts at the last free slot cannot both pass it while their claims
@@ -152,6 +173,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private readonly startReservations = new Map<string, number>();
   /** Ids whose claim a failed start left to another start in flight; the last start out hands it back. */
   private readonly releaseOwed = new Set<string>();
+  /** The sorted chat listing the pages of one walk share. Every chat write below drops it. */
+  private readonly chatListings = new ListingMemo<ChatSummary>();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -179,7 +202,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // source the reconnect scheduler and the takeover sweep consult.
     @Optional()
     private readonly shutdownService?: ShutdownService,
-  ) {}
+  ) {
+    this.engineRegistry.onRetire(id => this.chatListings.drop(id));
+  }
 
   /**
    * True from the start of the shutdown drain. An engine launched during the drain would be torn
@@ -422,6 +447,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // The findOne pre-check above is a fast path for the common case, but it's a check-then-insert
     // TOCTOU: two concurrent same-name creates both pass it, then one hits the name UNIQUE constraint.
     // Translate that violation to a 409 (matching the pre-check) instead of leaking a raw 500.
+    // On SQLite every caller shares one connection: opened beside another caller's transaction, this one would be a
+    // savepoint in it or carry that one's writes, and either rollback could undo what the other had answered for.
+    if (!(await awaitNoOpenTransaction(this.dataSource))) {
+      throw new ServiceUnavailableException(
+        `Session '${dto.name}' was not created: another database transaction stayed open. Retry the create.`,
+      );
+    }
     let saved: Session;
     try {
       saved = await this.dataSource.transaction(async manager => {
@@ -603,15 +635,153 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // COUNT, or delete()'s own requireSession — would let the mark land after that window. A mark
     // left behind when the fence refuses (409) is harmless and is cleared by the next start().
     this.markStopping(id);
+    // Running from here, before the claim: a claim with nothing running behind it would read as idle to the
+    // heartbeat, and a stop or a failed start here would hand it back while the rows are removed. It ends
+    // before the claim is handed back.
+    const endDelete = this.engineLifecycle.holdDelete(id);
+    // From here an operator stop or kill that records a stop is seen, also one whose record is already on its way.
+    const stops = this.joinDeleteStops(id);
+    let claimed = false;
     try {
-      if (this.ownership) await this.assertNotHeldElsewhere(id);
-      // A failed row read deleted nothing: the lifecycle drops the mark, and the count goes with it.
-      await this.engineLifecycle.delete(id, { onReadFailed: () => this.uncountStopRequest(id) });
+      try {
+        if (this.ownership) {
+          await this.assertNotHeldElsewhere(id);
+          await this.claimForDelete(id, this.ownership);
+          claimed = true;
+        }
+        // A failed write took nothing down, so the mark and count are undone as for a failed claim.
+        await this.keepDownForDelete(id, stops).catch((error: unknown) => {
+          this.engineLifecycle.clearStopping(id);
+          this.uncountStopRequest(id);
+          throw error;
+        });
+        // Refused or failed before it began removing (its row read, either fence), the delete leaves the session as
+        // it found it, so its count goes as a failed claim's does: a start it overlapped would take it for a stop.
+        let removing = false;
+        await this.engineLifecycle
+          .delete(id, {
+            onRemoving: () => {
+              removing = true;
+              stops.removing = true;
+            },
+          })
+          .catch((error: unknown) => {
+            if (!removing) this.uncountStopRequest(id);
+            throw error;
+          });
+      } finally {
+        endDelete();
+      }
       await this.releaseClaimBestEffort(id);
       this.stopRequests.delete(id);
     } catch (error) {
+      // A delete that removed nothing leaves the session as it found it. One that began to remove it leaves
+      // it stopped, as a process that dies part-way does.
+      await this.leaveDelete(id, stops);
+      // The row survived. A claim left on it lapses with nothing to renew it, and a peer would then
+      // adopt and restart the session the operator was deleting.
+      if (claimed) await this.releaseAfterTeardown(id);
       this.discardStopMarkForMissingSession(id, error);
       throw error;
+    }
+    await this.leaveDelete(id, stops);
+  }
+
+  private joinDeleteStops(id: string): DeleteStops {
+    let stops = this.deleteStops.get(id);
+    if (!stops) {
+      stops = { running: 0, recorded: false, removing: false, overtaken: false };
+      this.deleteStops.set(id, stops);
+    }
+    stops.running += 1;
+    return stops;
+  }
+
+  /**
+   * End a delete's share of the stop record. Another delete of the session still running here relies on it, so
+   * only the last one out takes it back, and only when they wrote it, none began removing the session, and no
+   * operator stop or kill recorded one meanwhile or is still writing one (it may land before the take-back).
+   */
+  private async leaveDelete(id: string, stops: DeleteStops): Promise<void> {
+    stops.running -= 1;
+    if (
+      stops.running === 0 &&
+      stops.recorded &&
+      !stops.removing &&
+      !stops.overtaken &&
+      !this.stopWritesInFlight.has(id)
+    ) {
+      // Not theirs while it is cleared, so a delete that begins and ends meanwhile leaves it alone.
+      stops.recorded = false;
+      stops.givingBack = this.clearDeleteStop(id).then(cleared => {
+        // Still on the row: a delete that began meanwhile shares it.
+        if (!cleared) stops.recorded = true;
+        stops.givingBack = undefined;
+      });
+      await stops.givingBack;
+    }
+    if (stops.running === 0 && !stops.givingBack) this.deleteStops.delete(id);
+  }
+
+  /**
+   * Hold the session's claim for as long as the delete runs. A row nobody held, or one whose holder's
+   * lease lapsed, could otherwise be claimed by a peer's start or takeover while its rows are removed,
+   * and the engine that peer launched would store messages for a session that no longer exists. The
+   * heartbeat renews the claim (a delete in flight counts as active) and delete() hands it back.
+   * Nothing has been removed when this refuses: a peer that claimed first answers the same 409 as
+   * assertNotHeldElsewhere, and a failed write is undone like a failed ownership read.
+   */
+  private async claimForDelete(id: string, ownership: SessionOwnershipService): Promise<void> {
+    let claimed: boolean;
+    try {
+      claimed = await ownership.claim(id);
+    } catch (error) {
+      this.engineLifecycle.clearStopping(id);
+      this.uncountStopRequest(id);
+      this.logger.warn(`Could not claim session ${id} for the delete; nothing was deleted`, {
+        sessionId: id,
+        action: 'session_delete_claim_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new ServiceUnavailableException(`Session ${id} could not be claimed for the delete; nothing was deleted`);
+    }
+    if (claimed) return;
+    this.uncountStopRequest(id);
+    // The claim is a conditional UPDATE, so an id with no row matches nothing too: answer its 404.
+    await this.findOne(id);
+    throw new ConflictException(`Session ${id} is running on another node`);
+  }
+
+  /**
+   * Record the delete as a stop on a row that has none, so a session whose delete ends part-way, with the
+   * process that ran it, stays down: no peer adopts it and no boot starts it. Written after a take-back in
+   * progress, which would otherwise clear it. 'deleting' rather than 'stopped', so the take-back can tell it
+   * from a stop that replaced it, also one another node recorded.
+   */
+  private async keepDownForDelete(id: string, stops: DeleteStops): Promise<void> {
+    if (stops.givingBack) await stops.givingBack;
+    const { affected } = await this.sessionRepository.update(
+      { id, desiredState: IsNull() },
+      { desiredState: 'deleting' },
+    );
+    if (affected === 1) stops.recorded = true;
+  }
+
+  /**
+   * Undo keepDownForDelete; answers whether the record is off the row. Best effort: the delete's own error is
+   * the answer, and a stop left on is safe. A stop recorded over it since is left alone.
+   */
+  private async clearDeleteStop(id: string): Promise<boolean> {
+    try {
+      await this.sessionRepository.update({ id, desiredState: 'deleting' }, { desiredState: null });
+      return true;
+    } catch (error) {
+      this.logger.warn(`Could not clear the stop a failed delete recorded for session ${id}`, {
+        sessionId: id,
+        action: 'session_delete_stop_clear_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
     }
   }
 
@@ -890,7 +1060,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     if (this.engines.get(id)) count();
     try {
       // The engine kill records the stop itself, once it has an engine to kill.
-      const session = await this.engineLifecycle.forceKill(id, { onReadFailed: uncount, onEngineFound: count });
+      const session = await this.engineLifecycle.forceKill(id, {
+        onReadFailed: uncount,
+        onEngineFound: count,
+        recordStop: write => this.recordStop(id, write),
+      });
       await this.releaseAfterTeardown(id);
       return session;
     } catch (error) {
@@ -904,12 +1078,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   /** Persist the operator's stop so boot auto-start and the takeover sweep leave the session down. */
   private async keepDown(id: string): Promise<void> {
-    await this.sessionRepository.update(id, { desiredState: 'stopped' });
+    await this.recordStop(id, () => this.sessionRepository.update(id, { desiredState: 'stopped' }));
+  }
+
+  /**
+   * Write an operator stop's or a kill's record of a stop. The deletes of the session running here keep their
+   * own record once it lands, and leave it alone while it is being written; it is written after a take-back
+   * in progress, which would otherwise clear it.
+   */
+  private async recordStop(id: string, write: () => Promise<unknown>): Promise<void> {
+    this.stopWritesInFlight.set(id, (this.stopWritesInFlight.get(id) ?? 0) + 1);
+    try {
+      const givingBack = this.deleteStops.get(id)?.givingBack;
+      if (givingBack) await givingBack;
+      await write();
+      const stops = this.deleteStops.get(id);
+      if (stops) stops.overtaken = true;
+    } finally {
+      const left = (this.stopWritesInFlight.get(id) ?? 1) - 1;
+      if (left > 0) this.stopWritesInFlight.set(id, left);
+      else this.stopWritesInFlight.delete(id);
+    }
   }
 
   /**
    * Re-record a stop an explicit start may have erased. The start clears the stop record with a
-   * write conditional on the row still reading 'stopped', and a stop's own write leaves that value
+   * write conditional on the row still reading what it read, and a stop's own write leaves 'stopped'
    * unchanged, so a stop landing just before the clear was wiped from the row while its in-memory
    * mark retired the start. The session was down, but the next boot would relaunch it. Any stop
    * counted while the start ran and leaving no engine behind is the operator's last word. A failed
@@ -963,7 +1157,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.releaseUnlessEngineActive(id);
   }
 
-  /** Hand the claim back unless something still runs here (engine, in-flight start, pending reconnect). */
+  /**
+   * Hand the claim back unless something still runs here (engine, in-flight start, pending reconnect,
+   * delete in flight).
+   */
   private async releaseUnlessEngineActive(id: string): Promise<void> {
     if (!this.ownership || this.engineLifecycle.isEngineActive(id)) {
       return;
@@ -1067,18 +1264,22 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * Every chat for a session, most-recent first, WITHOUT the response window. Callers that must
    * filter before paging (a chat-restricted API key) use this, then paginate themselves: filtering
    * after paginate() would hand back short or empty pages for an allowed chat past the window.
+   * `offset` is the window the caller is about to take: a later page reuses the list its walk's
+   * first page read a few seconds ago (see ListingMemo).
    */
-  async listChats(id: string): Promise<ChatSummary[]> {
+  async listChats(id: string, offset?: number): Promise<ChatSummary[]> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
     // Most-recent first. Sorting before the cap means a capped response is the N newest chats (what
     // clients show first) rather than an arbitrary slice.
-    return [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    return this.chatListings.read(id, offset, async () =>
+      [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)),
+    );
   }
 
   async getChats(id: string, opts: ListOptions = {}): Promise<ChatSummary[]> {
-    return paginate(await this.listChats(id), opts.limit, opts.offset);
+    return paginate(await this.listChats(id, opts.offset), opts.limit, opts.offset);
   }
 
   /**
@@ -1127,14 +1328,42 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.sendSeen(chatId, messageIds);
+    const authors = await this.groupAuthors(id, chatId, messageIds);
+    return engine.sendSeen(chatId, messageIds, authors).finally(() => this.chatListings.drop(id));
+  }
+
+  /**
+   * Who posted each named message of a group, from the rows the gateway stored. A group read receipt
+   * names the sender, and for a message the engine never kept (history backfill) these rows are the only
+   * place it is recorded. Best-effort: a read that cannot learn them still acknowledges what the engine
+   * can name on its own.
+   */
+  private async groupAuthors(
+    sessionId: string,
+    chatId: string,
+    messageIds?: string[],
+  ): Promise<ReadonlyMap<string, string> | undefined> {
+    if (!messageIds?.length || chatKind(chatId) !== 'group') return undefined;
+    try {
+      const rows = await this.messageRepository.find({
+        where: { sessionId, chatId, waMessageId: In(messageIds), direction: MessageDirection.INCOMING },
+        select: { waMessageId: true, author: true },
+      });
+      return new Map(rows.flatMap(row => (row.waMessageId && row.author ? [[row.waMessageId, row.author]] : [])));
+    } catch (error) {
+      this.logger.warn('Could not read who posted the messages a read names; sending the read without them', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
   }
 
   async markUnread(id: string, chatId: string): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.markUnread(chatId);
+    return engine.markUnread(chatId).finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1147,7 +1376,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.clearChatMessages(chatId);
+    const ok = await engine.clearChatMessages(chatId).finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }
@@ -1161,7 +1390,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.archiveChat(chatId, archive);
+    return engine.archiveChat(chatId, archive).finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1173,7 +1402,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.muteChat(chatId, muteUntil);
+    return engine.muteChat(chatId, muteUntil).finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1184,7 +1413,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.pinChat(chatId, pin);
+    return engine.pinChat(chatId, pin).finally(() => this.chatListings.drop(id));
   }
 
   /** Delete a chat. On success the gateway's stored copies of its messages are removed too. */
@@ -1193,7 +1422,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.deleteChat(chatId);
+    const ok = await engine.deleteChat(chatId).finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }

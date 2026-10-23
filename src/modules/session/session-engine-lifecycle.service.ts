@@ -481,6 +481,11 @@ export class SessionEngineLifecycle {
     return this.controls.delete(id, hooks);
   }
 
+  /** Delegate: SessionEngineControls.holdDelete. */
+  holdDelete(id: string): () => void {
+    return this.controls.holdDelete(id);
+  }
+
   /** Delegate: SessionEngineControls.shutdown. */
   shutdown(): Promise<void> {
     this.closed = true;
@@ -556,13 +561,15 @@ export class SessionEngineLifecycle {
 
   /**
    * True while this process still has anything alive for the session: a registered engine, an
-   * in-flight start(), or reconnect state whose armed/executing attempt will re-register one.
+   * in-flight start(), reconnect state whose armed/executing attempt will re-register one, or a
+   * delete still running (its engine is gone by then, but a peer that adopted the lapsed lease
+   * would start the session being deleted).
    * The ownership heartbeat consults this so a claim that no longer covers an engine stops being
    * renewed and can lapse for a peer to adopt; the service-level release paths consult it so an
    * "already starting/started" refusal never releases a session this node genuinely runs.
    */
   isEngineActive(id: string): boolean {
-    if (this.engines.has(id) || this.initializingSessions.has(id)) return true;
+    if (this.engines.has(id) || this.initializingSessions.has(id) || this.controls.isDeleting(id)) return true;
     // Reconnect state counts only while an attempt is actually pending: a timer armed by
     // scheduleReconnect, or one that has fired and is running executeReconnect (which has already
     // counted its attempt). The entry start() creates up

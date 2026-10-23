@@ -72,6 +72,9 @@ export const ACK_RECONCILE_DELAY_MS = 750;
  */
 export const PERSIST_RETRY_DELAY_MS = 300;
 
+/** How many of its messages marked edited a session remembers as marked (see markedEdited). */
+const EDITED_MARKS_KEPT_PER_SESSION = 500;
+
 /**
  * How a message insert ended: `yes` the row landed, `dup` a unique violation (`retried` says whether
  * it came from the retry, when the first attempt may have committed before its error), `failed` a
@@ -123,6 +126,12 @@ interface InFlightEntry {
   // Set when the revoke came from the engine, so message.revoked went out for it.
   revokeAnnounced?: boolean;
   editedBody?: string;
+  // The text the message arrived with, which an edit is compared with: one that repeats the text so far changes
+  // nothing. Unset while the message is admitted but not yet emitted.
+  body?: string;
+  // An edit held for the message or applied by the engine changed its text, or was asked for: the row it lands on is
+  // marked edited.
+  edited?: boolean;
   ackStatus?: MessageStatus;
   // Latest reaction per sender; '' means the sender withdrew theirs.
   reactions?: Record<string, string>;
@@ -231,6 +240,11 @@ export class MessageProjector {
   // On PostgreSQL the entry exists from the message's arrival (admitInbound), before its emit.
   private readonly inboundInFlight = new Map<string, InFlightEntry>();
 
+  // Ids whose row was marked edited, by session, while it has an engine: an own message delivered again loses its
+  // insert to that row, and is announced with the mark without reading it (see commitOwnSendEcho). Never stored; past
+  // EDITED_MARKS_KEPT_PER_SESSION the oldest is forgotten, and a repeat of it goes out unmarked.
+  private readonly markedEdited = new Map<string, Set<string>>();
+
   // Reaction/edit applies, extracted to a plain collaborator. It shares this instance's
   // messageMutations queue, so the public enqueue path and the queued applies serialize on one chain.
   private readonly mutationProjector: MessageMutationProjector;
@@ -262,11 +276,20 @@ export class MessageProjector {
       this.webhookService,
       this.messageMutations,
       this.logger,
+      (sessionId, waMessageId) => this.noteMarkedEdited(sessionId, waMessageId),
     );
     this.engines.onRetire((id, engine) => {
       for (const t of this.tickets.get(id) ?? []) if (t.engine === engine) t.drop();
       this.deleteRoomIfIdle(id);
+      if (!this.engines.has(id)) this.markedEdited.delete(id);
     });
+  }
+
+  private noteMarkedEdited(sessionId: string, waMessageId: string): void {
+    let marks = this.markedEdited.get(sessionId);
+    if (!marks) this.markedEdited.set(sessionId, (marks = new Set()));
+    marks.add(waMessageId);
+    if (marks.size > EDITED_MARKS_KEPT_PER_SESSION) marks.delete(marks.values().next().value!);
   }
 
   /**
@@ -404,12 +427,15 @@ export class MessageProjector {
     void this.sessionRepository.update(id, { lastActiveAt: new Date() }).catch(() => undefined);
     // Convert IncomingMessage to plain object for dispatch
     const messageData = { ...message };
+    // What an engine says of the edit it applied is for the session alone: no hook, row or consumer sees it.
+    delete messageData.originalBody;
     // Tracks what the chain's current copy lends a quote, so one taken mid-chain carries an earlier
     // handler's rewrite.
     const inFlightKey = `${id}:${message.id}`;
     const inFlight = turn
       ? Object.assign(turn.entry, { quote: quoteOf(messageData), ref: turn.entry.ref ?? refOf(messageData) })
       : this.trackInFlight(inFlightKey, messageData);
+    this.arrive(inFlight, message);
 
     const onFailure = (err: unknown): null => {
       this.logger.error(`onMessage handler failed for ${id}`, String(err));
@@ -465,7 +491,8 @@ export class MessageProjector {
     return turn.hookGate.promise.then(() => {
       if (!this.engines.isLive(id, engine)) return null;
       if (entry.revoked) return messageData;
-      if (entry.editedBody !== undefined) messageData.body = entry.editedBody;
+      // A delivery that came deleted has no text for the edit to replace.
+      if (entry.editedBody !== undefined && messageData.type !== 'revoked') messageData.body = entry.editedBody;
       return run();
     });
   }
@@ -482,9 +509,10 @@ export class MessageProjector {
   }
 
   /** Record a message as not yet written; a re-fire of the same id keeps the changes recorded so far. */
-  private trackInFlight(key: string, message: InboundMessageData) {
-    const { ref, revoked, revokeAnnounced, editedBody, ackStatus, reactions } = this.inboundInFlight.get(key) ?? {};
-    const inFlight = {
+  private trackInFlight(key: string, message: InboundMessageData): InFlightEntry {
+    const { ref, revoked, revokeAnnounced, editedBody, edited, ackStatus, reactions } =
+      this.inboundInFlight.get(key) ?? {};
+    const inFlight: InFlightEntry = {
       quote: quoteOf(message),
       // The first delivery of an id says whose message it is: a repeat sent from another chat must not
       // take that over from it, or a change aimed through the repeat would be judged by the wrong rule.
@@ -492,11 +520,31 @@ export class MessageProjector {
       revoked,
       revokeAnnounced,
       editedBody,
+      edited,
       ackStatus,
       reactions,
     };
     this.inboundInFlight.set(key, inFlight);
     return inFlight;
+  }
+
+  /**
+   * The engine handed the message over: an edit held until now is compared with the text it arrived with. One the
+   * engine applied itself changed that text, though a later one may have restored it (it names the arrival text only
+   * then, so it can equal the body), and marks the row the same way.
+   */
+  private arrive(entry: InFlightEntry, message: IncomingMessage): void {
+    entry.body = message.originalBody ?? message.body;
+    if (message.originalBody !== undefined || (entry.editedBody !== undefined && entry.editedBody !== entry.body)) {
+      entry.edited = true;
+    }
+  }
+
+  /** Keep an edit for the row of a message not written yet. One that repeats the text so far changes nothing. */
+  private holdEdit(entry: InFlightEntry, body: string): void {
+    const soFar = entry.editedBody ?? entry.body;
+    if (soFar !== undefined && body !== soFar) entry.edited = true;
+    entry.editedBody = body;
   }
 
   /** Drop the entry once its commit ended, unless a re-fire of the same id replaced it. */
@@ -553,7 +601,9 @@ export class MessageProjector {
       received: candidate === null ? 'null' : typeof candidate,
       action: 'hook_message_discarded',
     });
-    return { ...message };
+    const copy = { ...message };
+    delete copy.originalBody;
+    return copy;
   }
 
   /** `isStatusBroadcast` arm of {@link handleInboundMessage}: ingest into the status store, not the message pipeline. */
@@ -743,7 +793,10 @@ export class MessageProjector {
     if (!this.holdsInbound) return false;
     const entry = dbMessage.waMessageId ? this.inboundInFlight.get(`${id}:${dbMessage.waMessageId}`) : undefined;
     if (entry?.revoked) Object.assign(dbMessage, REVOKED_ROW_PATCH);
-    else if (entry?.editedBody !== undefined) dbMessage.body = entry.editedBody;
+    else {
+      if (entry?.editedBody !== undefined) dbMessage.body = entry.editedBody;
+      if (entry?.edited) dbMessage.metadata = { ...dbMessage.metadata, edited: true };
+    }
     return entry?.revoked === true;
   }
 
@@ -819,7 +872,9 @@ export class MessageProjector {
     const pending = waMessageId ? this.inboundInFlight.get(`${id}:${waMessageId}`) : undefined;
     if (!pending) return;
     const { ackStatus } = pending;
-    const rowChanges = Boolean(pending.revoked || pending.editedBody !== undefined || pending.reactions);
+    const rowChanges = Boolean(
+      pending.revoked || pending.editedBody !== undefined || pending.edited || pending.reactions,
+    );
     if (!ackStatus && !rowChanges) return;
     const advance = (): void => {
       if (!ackStatus) return;
@@ -864,6 +919,8 @@ export class MessageProjector {
         await this.messageRepository.update({ sessionId: id, waMessageId }, { body: pending.editedBody });
       }
       if (pending.reactions) await this.storeReactions(id, waMessageId, pending.reactions);
+      // The marker an edit of a stored row leaves, written last so a lost metadata race costs it alone.
+      if (pending.edited) await this.mutationProjector.markMessageEdited(id, waMessageId);
     } catch (err) {
       this.logger.error(`Failed to apply changes to message ${waMessageId}`, String(err));
     }
@@ -933,6 +990,7 @@ export class MessageProjector {
         return;
       }
       const result = await this.messageRepository.update({ sessionId, waMessageId }, REVOKED_ROW_PATCH);
+      this.markedEdited.get(sessionId)?.delete(waMessageId);
       if (!result?.affected || !notify) return;
       const row = await this.messageRepository.findOne({ where: { sessionId, waMessageId } });
       if (!row) return;
@@ -986,21 +1044,29 @@ export class MessageProjector {
    * The message as a revoke or edit that arrived while it was in flight left it, for its announcement:
    * null once the engine revoked it (message.revoked already went out, so the deleted content is not
    * announced after it), the revoked placeholder when only the REST delete did (a delete-for-me emits no
-   * engine revoke, and the message still exists for its sender), the edited body when edited
-   * (message.edited already went out with it). The stored row takes the same changes in
-   * {@link applyChangesMadeInFlight}.
+   * engine revoke, and the message still exists for its sender) or when it was delivered deleted, the edited
+   * body when edited (message.edited already went out with it), plus `edited: true` when the row is marked
+   * for it or already was (`rowMarked`): a consumer that held no copy of the message could not apply that
+   * event. The stored row takes the same changes in {@link applyChangesMadeInFlight}.
    */
-  private withChangesMadeInFlight(id: string, message: InboundMessageData): InboundMessageData | null {
+  private withChangesMadeInFlight(
+    id: string,
+    message: InboundMessageData,
+    rowMarked = false,
+  ): (InboundMessageData & { edited?: true }) | null {
     const pending = this.inboundInFlight.get(`${id}:${message.id}`);
     if (pending?.revokeAnnounced) return null;
-    if (pending?.revoked) {
-      // Nothing of the content survives, as in REVOKED_ROW_PATCH.
+    if (pending?.revoked || message.type === 'revoked') {
+      // Nothing of the content survives, as in REVOKED_ROW_PATCH: no edit held for it, and no mark.
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { media, quotedMessage, call, buttons, button, location, order, product, poll, mentionedIds, ...kept } =
         message;
       return { ...kept, body: '', type: 'revoked' };
     }
-    return pending?.editedBody === undefined ? message : { ...message, body: pending.editedBody };
+    const edited = rowMarked || pending?.edited;
+    // An edit the engine applied before the hand-over is in the body already.
+    if (pending?.editedBody === undefined) return edited ? { ...message, edited: true as const } : message;
+    return { ...message, body: pending.editedBody, ...(edited ? { edited: true as const } : {}) };
   }
 
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
@@ -1038,6 +1104,7 @@ export class MessageProjector {
     // Update last active timestamp
     void this.sessionRepository.update(id, { lastActiveAt: new Date() }).catch(() => undefined);
     const messageData = { ...message };
+    delete messageData.originalBody;
 
     const onFailure = (err: unknown): null => {
       this.logger.error(`onMessageCreate handler failed for ${id}`, String(err));
@@ -1050,6 +1117,7 @@ export class MessageProjector {
     const inFlight = turn
       ? Object.assign(turn.entry, { quote: quoteOf(messageData), ref: turn.entry.ref ?? refOf(messageData) })
       : this.trackInFlight(inFlightKey, messageData);
+    this.arrive(inFlight, message);
     // Execute hook for message sent - plugins can modify or stop processing. Like the inbound path,
     // the hook chain runs concurrently and the commit waits its turn on the chat's queue.
     const prepared = this.startHookChain(id, engine, turn, messageData, () =>
@@ -1104,6 +1172,7 @@ export class MessageProjector {
       resolveFeatureFlags(this.configService).storeEphemeralMessages ||
       !(outgoing.ephemeralDuration && outgoing.ephemeralDuration > 0);
 
+    let rowMarked = false;
     if (mayPersist) {
       const dbMessage = this.messageRepository.create({
         sessionId: id,
@@ -1129,8 +1198,19 @@ export class MessageProjector {
       const outcome = await this.insertWithRetry(id, engine, dbMessage, 'outgoing');
       if (outcome.landed === 'stale') return;
       // The REST writer may have won either attempt; its row still takes the echo's pending changes.
-      if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, outgoing.id, false, claimOf(outgoing));
+      if (outcome.landed === 'dup') {
+        this.applyChangesMadeInFlight(id, outgoing.id, false, claimOf(outgoing));
+        // That row may be older than this delivery and edited since, the edit still being written: announced once the
+        // changes queued for the message have run, with the mark they left.
+        rowMarked = await new Promise<boolean>(resolve =>
+          this.enqueueMessageMutation(id, outgoing.id, () =>
+            Promise.resolve(resolve(this.markedEdited.get(id)?.has(outgoing.id) === true)),
+          ),
+        );
+      }
       if (outcome.landed === 'yes') {
+        // The id had no row, so a mark remembered for it was of a row removed since.
+        this.markedEdited.get(id)?.delete(outgoing.id);
         this.applyChangesMadeInFlight(id, outgoing.id, insertedCleared);
         // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
         // composed sends exactly like API sends.
@@ -1153,11 +1233,11 @@ export class MessageProjector {
       }
     }
 
-    const announced = this.withChangesMadeInFlight(id, finalMessage);
-    if (!announced) return;
-    void this.webhookService.dispatch(id, 'message.sent', announced);
+    const sent = this.withChangesMadeInFlight(id, finalMessage, rowMarked);
+    if (!sent) return;
+    void this.webhookService.dispatch(id, 'message.sent', sent);
     // Emit real-time event to WebSocket clients (as message.sent, not message.received)
-    this.eventsGateway.emitMessageSent(id, announced);
+    this.eventsGateway.emitMessageSent(id, sent);
   }
 
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
@@ -1407,7 +1487,7 @@ export class MessageProjector {
       // See applyReactionQueued: judged foreign, it is not kept for the row, and a stored row decides.
       const source = { kind: 'edit', chatId: message.chatId, fromMe: message.fromMe, author: message.author } as const;
       if (this.foreignToInFlight(inFlight, source)) needsRow = true;
-      else inFlight.editedBody = message.body;
+      else this.holdEdit(inFlight, message.body);
     }
     this.mutationProjector.applyMessageEditQueued(id, message, needsRow);
   }
@@ -1444,7 +1524,11 @@ export class MessageProjector {
     // With a `source`, the message still arriving takes the edit only if it agrees with it, and the row
     // only if it is not foreign to it, as for recordRevoke.
     const inFlight = this.inboundInFlight.get(`${sessionId}:${messageId}`);
-    if (inFlight && !(source && this.foreignToInFlight(inFlight, source))) inFlight.editedBody = body;
+    if (inFlight && !(source && this.foreignToInFlight(inFlight, source))) {
+      this.holdEdit(inFlight, body);
+      // Asked for by the caller, and marked as the stored row is: the text it carries does not matter.
+      inFlight.edited = true;
+    }
     return this.mutationProjector.recordOutboundMessageEdit(sessionId, messageId, body, source);
   }
 

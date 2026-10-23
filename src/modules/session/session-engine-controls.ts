@@ -7,11 +7,12 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { In, QueryDeepPartialEntity, Repository, DataSource } from 'typeorm';
+import { isUUID } from 'class-validator';
+import { EntityTarget, In, Repository, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
-import { BatchStatus, MessageBatch } from '../message/entities/message-batch.entity';
-import { stripBatchMediaPayloads } from '../message/batch-media.util';
+import { MessageBatch } from '../message/entities/message-batch.entity';
+import { failUnfinishedSessionBatches } from '../message/batch-media.util';
 import { SendIdempotencyKey } from '../message/entities/send-idempotency-key.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
@@ -22,6 +23,7 @@ import { BaileysStoredMessage } from '../../engine';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
 import { closeSessionWrites } from '../../common/utils/session-write-scope';
+import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -45,11 +47,62 @@ import {
 
 /**
  * Rows of the tables that grow with traffic (messages, webhook outbox events, webhook delivery failures)
- * removed per statement when a session is deleted. Small enough to stay under PostgreSQL's statement timeout
- * and far below either dialect's bind-parameter limit, and short enough on SQLite (one writer, and each
- * message row also fires the full-text index trigger) that other sessions are not stalled behind it.
+ * removed per statement when a session is deleted. On SQLite this is the most a batch may take: far below the
+ * bind-parameter limit, and the loop sizes each batch to the time the last one took (see
+ * SESSION_DELETE_BATCH_TARGET_MS_SQLITE), because one writer serves every session and each message row also
+ * fires the full-text index trigger. A larger batch costs a little less per row but stalls longer: a
+ * 300k-message session deletes 1.2 to 1.7 times faster at 2000 rows than at 500 (it depends on the load of the
+ * host), with a longer worst statement. Most of the gain over the first batched delete comes from leaving the
+ * session out of the delete's condition, see deleteTrafficRowsInBatches.
  */
-export const SESSION_DELETE_BATCH_SIZE = 500;
+export const SESSION_DELETE_BATCH_SIZE_SQLITE = 2000;
+
+/**
+ * How long a SQLite batch should take. The driver runs a statement on the event loop, so this is the longest
+ * the process is held for one batch. The cost per row rises with the size of the database (about 75 microseconds
+ * per row at 300k messages, 170 at 1.2M), which a fixed row count turned into a stall that grew with the history.
+ * A batch costs less per row the larger it is, so a shorter target bounds the stall more tightly and lengthens
+ * the whole delete: at 150 ms it takes about 1.4 times as long as at 2000 rows a batch, at 250 ms 1.0 to 1.2 times.
+ */
+export const SESSION_DELETE_BATCH_TARGET_MS_SQLITE = 150;
+
+/** The first SQLite batch and the least one may shrink to, so a slow database is never started on a large batch. */
+export const SESSION_DELETE_BATCH_MIN_SQLITE = 250;
+
+/**
+ * The pause after a SQLite batch. Yielding for one turn of the event loop lets a request take one step, but a
+ * request takes several turns and each was followed by the next batch, so it waited out several batches. A
+ * short pause lets it finish before the next one starts.
+ */
+export const SESSION_DELETE_PAUSE_MS_SQLITE = 5;
+
+/**
+ * The same on PostgreSQL, where a statement does not hold the process and a larger batch buys little (a million
+ * small rows on an analyzed table delete in about the same few seconds at 500 or 2000 rows). What bounds a
+ * statement there is its time under the statement timeout, and that follows the bytes of the rows it deletes: a
+ * message that keeps its media inline stores megabytes per row. So it keeps the smaller batch and its headroom.
+ */
+export const SESSION_DELETE_BATCH_SIZE_POSTGRES = 500;
+
+/**
+ * How many batches of a webhook outbox or delivery failure pass one read feeds on PostgreSQL. These two tables
+ * have no index that orders a session's rows, so each read goes back over the session's whole index range,
+ * including the entries of rows already deleted that a vacuum has not yet removed; a read after every batch made
+ * the delete take longer than linear, by seconds at 300,000 rows and far more beyond.
+ */
+export const SESSION_DELETE_READ_AHEAD_POSTGRES = 20;
+
+/**
+ * The size of the next SQLite batch: the last one scaled to the target time, growing by at most a factor of two
+ * so a fast first batch cannot overshoot into a slow one, and kept between the floor and the ceiling.
+ */
+export function nextSqliteDeleteBatchSize(rows: number, tookMs: number): number {
+  const scaled = Math.round((rows * SESSION_DELETE_BATCH_TARGET_MS_SQLITE) / Math.max(tookMs, 1));
+  return Math.max(SESSION_DELETE_BATCH_MIN_SQLITE, Math.min(SESSION_DELETE_BATCH_SIZE_SQLITE, rows * 2, scaled));
+}
+
+/** One table's pass of the batched delete: the repository to delete from and the reader of the next page of ids. */
+type TrafficPass = { rows: Repository<{ id: string }>; next: (take: number) => Promise<string[]> };
 
 /** A start refused because an operator stopped the session. Same 409 on the wire as any conflict. */
 export class SessionStoppedException extends ConflictException {}
@@ -96,6 +149,10 @@ export interface StopHooks {
   onReadFailed?: () => void;
   /** forceKill() only: runs synchronously once there is an engine to kill; records the stop request. */
   onEngineFound?: () => void;
+  /** forceKill() only: runs the write of the kill's stop record, which it is handed; without it, the write runs alone. */
+  recordStop?: (write: () => Promise<unknown>) => Promise<void>;
+  /** delete() only: runs once the delete starts removing the session's data, the session:deleted hook first. */
+  onRemoving?: () => void;
 }
 
 /**
@@ -173,6 +230,12 @@ export class SessionEngineControls {
   private readonly reconnectStates: Map<string, ReconnectState>;
   private readonly stuckAuthRecoveryUsed: Set<string>;
   private readonly initializingSessions: Set<string>;
+  /**
+   * Deletes in flight per id, counted so that two overlapping deletes of one id do not end each other's hold.
+   * The stop mark of a delete cannot refuse a start for as long as the delete runs: start() takes a mark that
+   * was already set when it began for a stale one and clears it.
+   */
+  private readonly deleting = new Map<string, number>();
 
   constructor(private readonly host: SessionEngineControlsHost) {
     this.sessionRepository = host.sessionRepository;
@@ -191,6 +254,24 @@ export class SessionEngineControls {
     this.reconnectStates = host.reconnectStates;
     this.stuckAuthRecoveryUsed = host.stuckAuthRecoveryUsed;
     this.initializingSessions = host.initializingSessions;
+  }
+
+  /**
+   * True while a delete of the session runs: from before SessionService.delete claims the session until it
+   * returns or throws, credential purge included.
+   */
+  isDeleting(id: string): boolean {
+    return this.deleting.has(id);
+  }
+
+  /** Count a delete of the session as running until the returned call; see isDeleting. */
+  holdDelete(id: string): () => void {
+    this.deleting.set(id, (this.deleting.get(id) ?? 0) + 1);
+    return () => {
+      const running = (this.deleting.get(id) ?? 1) - 1;
+      if (running > 0) this.deleting.set(id, running);
+      else this.deleting.delete(id);
+    };
   }
 
   /** findOne-or-404 with the runtime-state projection, mirroring SessionService.findOne. */
@@ -245,8 +326,8 @@ export class SessionEngineControls {
 
       // An operator's stop outranks any start but POST /start, so this refuses boot auto-start and
       // the takeover sweep, which pick their rows once and launch them seconds apart, when a stop
-      // landed after that read.
-      if (session.desiredState === 'stopped' && !explicit) {
+      // landed after that read. A delete's record ('deleting') counts as one.
+      if (session.desiredState && !explicit) {
         throw new SessionStoppedException(`Session ${id} was stopped`);
       }
 
@@ -282,6 +363,13 @@ export class SessionEngineControls {
       // again, so a refused start does not leave a false "already starting" mark behind (briefly held).
       await this.fences.awaitPendingTeardown(session.name);
 
+      // A delete still running outranks every start, however long it has run: the mark it set is not a
+      // stale one, and clearing it below would let an engine start under the delete that is removing the
+      // session (the engine would outlive the row). Checked here, with no await before the clear.
+      if (this.deleting.has(id)) {
+        throw new SessionStoppedException(`Session ${id} is being deleted`);
+      }
+
       // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark, but
       // yield to one set after this start began, leaving it in place.
       if (this.stoppingSessions.has(id) && this.stoppingSessions.stamp(id) !== markAtEntry) {
@@ -302,7 +390,7 @@ export class SessionEngineControls {
       // mark again and retires this start after its init. A launch that fails after the clear still
       // counts as the start the operator asked for.
       const { desiredState } = await this.requireSession(id);
-      if (desiredState === 'stopped' && (!explicit || session.desiredState !== 'stopped')) {
+      if (desiredState && (!explicit || !session.desiredState)) {
         this.stoppingSessions.add(id);
         throw new SessionStoppedException(`Session ${id} was stopped`);
       }
@@ -318,8 +406,8 @@ export class SessionEngineControls {
       if (this.host.isClosed()) {
         throw closedRefusal();
       }
-      if (desiredState === 'stopped') {
-        await this.sessionRepository.update({ id, desiredState: 'stopped' }, { desiredState: null });
+      if (desiredState) {
+        await this.sessionRepository.update({ id, desiredState }, { desiredState: null });
         // The clear stands (this start was the operator's), but the hook must not fire for a start
         // shutdown overtook during the write.
         if (this.host.isClosed()) {
@@ -417,14 +505,7 @@ export class SessionEngineControls {
         retired = false;
       }
       if (retired) {
-        const resurrected = this.engines.get(id);
-        if (resurrected) {
-          await this.fences.destroyWithEscalation(id, resurrected);
-          this.engines.deleteIfLive(id, resurrected);
-        }
-        // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created
-        // them — purge again so the window leaves no credential residue behind (no-op for a stop()).
-        await this.host.purgeAuthDirsIfDeleted(id);
+        await this.reapRetiredEngine(id);
       } else if (this.host.isClosed()) {
         // Shutdown destroys every engine it finds, this one included, and skips initialize() for an
         // engine it caught mid-start. Either way the session is not kept, so this is no success. A
@@ -437,12 +518,36 @@ export class SessionEngineControls {
         // The engine is registered and running. A failed read (a missing row stays NotFound) must not
         // report a start that worked as failed: the retry a transient database error buys would answer
         // "already started". The row read on entry stands in for the one that failed.
+        // A row found gone only now is the retirement the failed read above could not report: the engine
+        // goes with it.
+        if (!retired && error instanceof NotFoundException) await this.reapRetiredEngine(id);
         if (retired || error instanceof NotFoundException) throw error;
         return session;
       }
     } finally {
       this.initializingSessions.delete(id);
     }
+  }
+
+  /**
+   * Tears down the engine a start registered for a session that was stopped or deleted meanwhile, and drops
+   * the reconnect state it armed for it.
+   */
+  private async reapRetiredEngine(id: string): Promise<void> {
+    const resurrected = this.engines.get(id);
+    if (resurrected) {
+      await this.fences.destroyWithEscalation(id, resurrected);
+      this.engines.deleteIfLive(id, resurrected);
+    }
+    // The reconnect state this start armed up front serves no engine now, and the stop or delete that retired it
+    // may have run before the state was armed, so nothing else would drop it. A replacement engine that
+    // registered meanwhile keeps its own.
+    if (!this.engines.has(id)) {
+      this.host.cancelReconnect(id);
+    }
+    // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created them, so
+    // purge again: the window then leaves no credential residue behind (no-op for a stop()).
+    await this.host.purgeAuthDirsIfDeleted(id);
   }
 
   async stop(id: string, hooks: StopHooks = {}): Promise<Session> {
@@ -644,15 +749,14 @@ export class SessionEngineControls {
     // explicit start. Recorded only once there is an engine to kill, and before the teardown, so a
     // POST /start that lands after the eviction clears it and stands. A failed write must not keep a
     // wedged engine alive, so it is logged and the kill goes on.
-    await this.sessionRepository
-      .update(id, { desiredState: 'stopped' })
-      .catch((error: unknown) =>
-        this.logger.error(
-          'Failed to record the force-kill as a stop',
-          error instanceof Error ? error.message : String(error),
-          { sessionId: id, action: 'force_kill_keep_down_failed' },
-        ),
-      );
+    const write = (): Promise<unknown> => this.sessionRepository.update(id, { desiredState: 'stopped' });
+    await (hooks.recordStop ? hooks.recordStop(write) : write()).catch((error: unknown) =>
+      this.logger.error(
+        'Failed to record the force-kill as a stop',
+        error instanceof Error ? error.message : String(error),
+        { sessionId: id, action: 'force_kill_keep_down_failed' },
+      ),
+    );
 
     // Announced by the write below rather than from the engine callback, as in stop().
     this.operatorTeardowns.set(id, engine);
@@ -711,6 +815,7 @@ export class SessionEngineControls {
     // rejected 409 from fence #2 leaves them intact (the session still exists).
     let parentDeleted = false;
     const writes = closeSessionWrites(this.host.dataSource(), id);
+    const endDelete = this.holdDelete(id);
 
     try {
       // Stop engine if running — time-bounded + isolated so a stuck Chromium can't wedge the delete;
@@ -750,6 +855,7 @@ export class SessionEngineControls {
       }
 
       await writes.drain();
+      hooks.onRemoving?.();
       // Execute hook BEFORE delete so plugins can access session data
       await this.hookManager.execute(
         'session:deleted',
@@ -766,7 +872,9 @@ export class SessionEngineControls {
       );
 
       // DB removal is NOT best-effort: a genuine failure must surface (500) rather than be swallowed.
-      // Delete every child row explicitly, in one transaction, children before the parent. For
+      // Delete every child row explicitly, children before the parent: the three tables that grow with traffic
+      // go first, in batches (a failure part-way keeps the session with fewer rows), then the rest and the
+      // parent in one transaction. For
       // messages/message_batches this is load-bearing: they carry a plain sessionId with no FK, so
       // nothing else would ever remove them. webhooks/templates/baileys_stored_messages (and
       // automation_rules) DO declare an ON DELETE CASCADE FK that fires on BOTH engines —
@@ -786,7 +894,15 @@ export class SessionEngineControls {
       // instance-keyed inbound dedup record, payload already dropped after dispatch, always pruned
       // after INGRESS_DEDUP_RETENTION_DAYS), lid_mappings (a global cache by design) and audit_logs (the audit trail).
       await this.deleteTrafficRowsInBatches(id);
-      await this.host.dataSource().transaction(async manager => {
+      // On SQLite every caller shares one connection: opened inside another caller's transaction, this one
+      // would only be a savepoint in it, undone if that one rolls back after this delete has answered.
+      const dataSource = this.host.dataSource();
+      if (!(await awaitNoOpenTransaction(dataSource))) {
+        throw new ServiceUnavailableException(
+          `Session ${id} was not deleted: another database transaction stayed open. Retry the delete.`,
+        );
+      }
+      await dataSource.transaction(async manager => {
         await manager.delete(Message, { sessionId: id });
         await manager.delete(MessageBatch, { sessionId: id });
         await manager.delete(ChatState, { sessionId: id });
@@ -816,10 +932,14 @@ export class SessionEngineControls {
       // carried before 0.23.5, and the boot migration keeps a legacy one it could not rename. Unless
       // it is another session's id, whatever its shape (an import accepts any safe key): the dirs it
       // names are then that session's live login, the same exact-id guard the migration keeps. A
-      // failed lookup withholds the name rather than fail a delete that has already committed.
+      // failed lookup withholds the name rather than fail a delete that has already committed. On
+      // PostgreSQL the id column is a uuid, so a name of any other shape is no session's id there, and
+      // looking it up would fail rather than miss.
       // Keyed by `id`, not `session.id`: TypeORM clears a removed entity's primary key, so session.id
       // is undefined here and the purge would refuse it as an unsafe key and remove nothing.
-      const nameIsAnId = await this.sessionRepository.exists({ where: { id: session.name } }).catch(() => true);
+      const nameIsAnId =
+        (dataSource.options.type !== 'postgres' || isUUID(session.name)) &&
+        (await this.sessionRepository.exists({ where: { id: session.name } }).catch(() => true));
       await this.engineFactory.purgeSessionData(id, nameIsAnId ? undefined : session.name);
     } catch (error) {
       // The session survives, but the write scopes closed above stay retired for good: a bulk batch
@@ -829,6 +949,7 @@ export class SessionEngineControls {
       throw error;
     } finally {
       writes.release();
+      endDelete();
       // Always clear the teardown mark so a later recreate/start with this id isn't suppressed. This
       // stop mark was set after fence #1, so clearing it on a rejected 409 only undoes what THIS
       // delete added — it does NOT touch reconnect timer / engine / last status / error / recovery
@@ -859,25 +980,21 @@ export class SessionEngineControls {
 
   /**
    * Fail the session's unfinished bulk batches after a delete that closed its write scopes but did not
-   * remove it. Written here rather than through the batch service, which this module cannot reach without
-   * a cycle; the rows are the same ones its reapers fail, with the media payloads stripped as on every
-   * terminal path. Best effort: the database that just failed the delete may fail this too, and the
+   * remove it. Written against the table rather than through the batch service, which this module cannot
+   * reach without a cycle. Best effort: the database that just failed the delete may fail this too, and the
    * boot reaper still gets the row on the next start.
    */
   private async failUnfinishedBatches(sessionId: string): Promise<void> {
     try {
-      const batches = this.host.dataSource().getRepository(MessageBatch);
-      const unfinished = await batches.find({
-        where: { sessionId, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
-      });
-      for (const batch of unfinished) {
-        stripBatchMediaPayloads(batch.messages);
-        await batches.update({ id: batch.id, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) }, {
-          status: BatchStatus.FAILED,
-          completedAt: new Date(),
-          messages: batch.messages,
-        } as QueryDeepPartialEntity<MessageBatch>);
+      const dataSource = this.host.dataSource();
+      // Not inside another caller's transaction on the shared connection, where the fail would roll back with it.
+      if (!(await awaitNoOpenTransaction(dataSource))) {
+        this.logger.warn(`Failing the unfinished batches of session ${sessionId} inside another open transaction`, {
+          sessionId,
+          action: 'session_delete_foreign_transaction_open',
+        });
       }
+      await failUnfinishedSessionBatches(dataSource, sessionId);
     } catch (error) {
       this.logger.warn(`Could not fail the unfinished batches of session ${sessionId} after a failed delete`, {
         sessionId,
@@ -897,19 +1014,108 @@ export class SessionEngineControls {
    * The batches are not one atomic unit: a failure part-way leaves the session with fewer rows, and
    * repeating the delete finishes the job. Nothing new can land meanwhile, because the engine is gone and
    * the closing write scope refuses outbound writes. SQLite resolves each statement within the same tick, so
-   * the loop yields to the event loop between batches.
+   * the loop pauses between batches to let the event loop run, and sizes each batch to the time the last one took.
+   *
+   * A batch is removed by primary key alone. Its ids were read for this session a statement earlier, so a
+   * sessionId condition beside the id list adds no safety, and it costs: SQLite plans the delete as a walk
+   * over the session's remaining rows that filters on the list, once per batch (PostgreSQL does too while its
+   * statistics are missing or stale), which made a long history take longer than linear.
    */
   private async deleteTrafficRowsInBatches(sessionId: string): Promise<void> {
-    for (const entity of [Message, WebhookOutboxEvent, WebhookDeliveryFailure]) {
-      const rows = this.host.dataSource().getRepository<{ id: string; sessionId: string }>(entity);
+    const dataSource = this.host.dataSource();
+    const postgres = dataSource.options.type === 'postgres';
+    let size = postgres ? SESSION_DELETE_BATCH_SIZE_POSTGRES : SESSION_DELETE_BATCH_MIN_SQLITE;
+    const readAhead = postgres ? SESSION_DELETE_READ_AHEAD_POSTGRES : 1;
+    const head = (entity: EntityTarget<{ id: string; sessionId: string }>): TrafficPass => {
+      const repository = dataSource.getRepository(entity);
+      let ahead: string[] = [];
+      let more = true;
+      return {
+        rows: repository,
+        next: async take => {
+          // What is left of the last read is still in the table and comes first in the next, so it is replaced.
+          if (ahead.length < take && more) {
+            const rows = take * readAhead;
+            ahead = (await repository.find({ select: { id: true }, where: { sessionId }, take: rows })).map(
+              row => row.id,
+            );
+            more = ahead.length === rows;
+          }
+          return ahead.splice(0, take);
+        },
+      };
+    };
+    const messages = dataSource.getRepository(Message);
+    const passes: TrafficPass[] = [
+      { rows: messages, next: this.stampedMessageIds(sessionId) },
+      { rows: messages, next: this.unstampedMessageIds(sessionId) },
+      head(WebhookOutboxEvent),
+      head(WebhookDeliveryFailure),
+    ];
+    for (const { rows, next } of passes) {
       for (;;) {
-        const batch = await rows.find({ select: { id: true }, where: { sessionId }, take: SESSION_DELETE_BATCH_SIZE });
-        if (batch.length === 0) break;
-        await rows.delete({ sessionId, id: In(batch.map(row => row.id)) });
-        if (batch.length < SESSION_DELETE_BATCH_SIZE) break;
-        await new Promise<void>(resolve => setImmediate(resolve));
+        const started = performance.now();
+        const ids = await next(size);
+        if (ids.length === 0) break;
+        await rows.delete({ id: In(ids) });
+        if (ids.length < size) break;
+        if (!postgres) size = nextSqliteDeleteBatchSize(ids.length, performance.now() - started);
+        await new Promise<void>(resolve =>
+          postgres ? setImmediate(resolve) : setTimeout(resolve, SESSION_DELETE_PAUSE_MS_SQLITE),
+        );
       }
     }
+  }
+
+  /**
+   * The messages that carry a timestamp, a page at a time in the order of IDX_messages_session_timestamp_id,
+   * each page starting after the last row of the one before. A select that restarted from the head of the
+   * session's range every time stepped over every entry the earlier batches had deleted: PostgreSQL keeps
+   * those in the index until a vacuum removes them, so the cost of the loop grew with the square of the history.
+   */
+  private stampedMessageIds(sessionId: string): (take: number) => Promise<string[]> {
+    const messages = this.host.dataSource().getRepository(Message);
+    let last: { timestamp: number; id: string } | undefined;
+    return async take => {
+      const query = messages
+        .createQueryBuilder('message')
+        .select('message.id', 'id')
+        .addSelect('message.timestamp', 'timestamp')
+        .where('message.sessionId = :sessionId AND message.timestamp IS NOT NULL', { sessionId });
+      if (last) query.andWhere('(message.timestamp, message.id) > (:timestamp, :id)', last);
+      const page = await query
+        .orderBy('message.timestamp', 'ASC')
+        .addOrderBy('message.id', 'ASC')
+        .limit(take)
+        .getRawMany<{ id: string; timestamp: string | number }>();
+      const end = page[page.length - 1];
+      if (end) last = { timestamp: Number(end.timestamp), id: end.id };
+      return page.map(row => row.id);
+    };
+  }
+
+  /**
+   * The messages without a timestamp (a send that was never acknowledged), after the stamped ones, paged by
+   * id. Ordering by the null timestamp as well is what lets PostgreSQL read the index in order instead of
+   * sorting every remaining row for each page.
+   */
+  private unstampedMessageIds(sessionId: string): (take: number) => Promise<string[]> {
+    const messages = this.host.dataSource().getRepository(Message);
+    let lastId: string | undefined;
+    return async take => {
+      const query = messages
+        .createQueryBuilder('message')
+        .select('message.id', 'id')
+        .where('message.sessionId = :sessionId AND message.timestamp IS NULL', { sessionId });
+      if (lastId !== undefined) query.andWhere('message.id > :lastId', { lastId });
+      const page = await query
+        .orderBy('message.timestamp', 'ASC')
+        .addOrderBy('message.id', 'ASC')
+        .limit(take)
+        .getRawMany<{ id: string }>();
+      if (page.length > 0) lastId = page[page.length - 1].id;
+      return page.map(row => row.id);
+    };
   }
 
   /**
